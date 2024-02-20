@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.Design;
 using System.Diagnostics;
 using System.IO;
@@ -9,6 +10,7 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -221,105 +223,98 @@ namespace Dev
 
         internal sealed class AccessorInformation
         {
-            private static readonly AsyncLocal<int> AccessorId = new();
-            private static int LastAccessorId;
+            private static readonly AsyncLocal<int> AsyncLocalId = new();
+            private static int LastAsyncLocalId;
 
-            private readonly Dictionary<int, AccessState> accessorMap = new();
+            private readonly Dictionary<int, TaskState> taskMap = new();
 
-            public static int GetCurrentId()
+            public static int GetAsyncLocalId()
             {
-                if (AccessorId.Value == 0)
+                if (AsyncLocalId.Value == 0)
                 {
-                    lock (AccessorId)
+                    lock (AsyncLocalId)
                     {
-                        if (AccessorId.Value == 0)
-                            AccessorId.Value = ++LastAccessorId;
+                        if (AsyncLocalId.Value == 0)
+                            AsyncLocalId.Value = ++LastAsyncLocalId;
                     }
                 }
 
-                return AccessorId.Value;
+                return AsyncLocalId.Value;
             }
 
             public void Request(int taskId)
             {
-                var accessorId = GetCurrentId();
-                lock (this.accessorMap)
+                var asyncLocalId = GetAsyncLocalId();
+                lock (this.taskMap)
                 {
-                    if (this.accessorMap.TryGetValue(accessorId, out var state) == false)
-                        this.accessorMap.Add(accessorId, state = new());
-
-                    state.Tasks.Add(taskId, AllocationState.Requested);
+                    Debug.Assert(this.taskMap.ContainsKey(taskId) == false);
+                    this.taskMap[taskId] = new() { AsyncLocalId = asyncLocalId };
                 }
             }
 
             public void Assign(int taskId)
             {
-                var accessorId = GetCurrentId();
-                lock (this.accessorMap)
+                lock (this.taskMap)
                 {
-                    if (this.accessorMap.TryGetValue(accessorId, out var state) == false)
+                    if (this.taskMap.TryGetValue(taskId, out var state) == false)
                     {
-                        Debug.Fail("state not found");
+                        Debug.Fail($"{nameof(TaskState)} not found. id:{taskId}");
                         return;
                     }
 
-                    Debug.Assert(state.Tasks.ContainsKey(taskId));
-                    state.Tasks[taskId] = AllocationState.Assigned;
+                    state.AllocationState = AllocationState.Assigned;
                 }
             }
 
             public void Finish(int taskId)
             {
-                var accessorId = GetCurrentId();
-                lock (this.accessorMap)
+                lock (this.taskMap)
                 {
-                    if (this.accessorMap.TryGetValue(accessorId, out var state) == false)
-                    {
-                        Debug.Fail("state not found");
-                        return;
-                    }
-
-                    state.Tasks.Remove(taskId);
-                    if (state.Count == 0)
-                        this.accessorMap.Remove(accessorId);
+                    var removed = this.taskMap.Remove(taskId);
+                    Debug.Assert(removed);
                 }
             }
 
             public bool BeginAwait(ExclusiveResourceTask task)
             {
-                var accessorId = GetCurrentId();
-
-                lock (this.accessorMap)
+                var asyncLocalId = GetAsyncLocalId();
+                lock (this.taskMap)
                 {
-                    if (this.accessorMap.TryGetValue(accessorId, out var state) == false)
+                    if (this.taskMap.TryGetValue(task.Id, out var state) == false)
                         return task.IsCompleted;
 
-                    if (state.Awaiting || state.Count > 1)
-                        return false; // self-deadlock
+                    var isSelfDeadlock = this.taskMap.Any(kv
+                        => kv.Key != task.Id
+                        && kv.Value.AllocationState == AllocationState.Assigned
+                        && kv.Value.AsyncLocalId == asyncLocalId);
+                    if (isSelfDeadlock)
+                        return task.IsCompleted;
 
-                    state.Awaiting = true;
+                    if (state.Awaiters.Contains(asyncLocalId))
+                        return false;
+
+                    state.Awaiters.Add(asyncLocalId);
                     return true;
                 }
             }
 
-            public void EndAwait()
+            public void EndAwait(ExclusiveResourceTask task)
             {
-                var accessorId = GetCurrentId();
-                lock (this.accessorMap)
+                var asyncLocalId = GetAsyncLocalId();
+                lock (this.taskMap)
                 {
-                    if (this.accessorMap.TryGetValue(accessorId, out var state) == false)
-                        return;
-
-                    Debug.Assert(state.Awaiting);
-                    state.Awaiting = false;
+                    if (this.taskMap.TryGetValue(task.Id, out var state))
+                        state.Awaiters.Remove(asyncLocalId);
+                    else
+                        Debug.Assert(task.IsCompleted);
                 }
             }
 
-            private sealed class AccessState
+            private sealed class TaskState
             {
-                public Dictionary<int, AllocationState> Tasks { get; } = new();
-                public bool Awaiting { get; set; }
-                public int Count => this.Tasks.Count;
+                public int AsyncLocalId { get; init; }
+                public AllocationState AllocationState { get; set; }
+                public List<int> Awaiters { get; } = new();
             }
 
             private enum AllocationState
@@ -395,10 +390,16 @@ namespace Dev
                         foreach (var resource in task.resourceList.Where(e => deadlockList.Contains(e) == false))
                         {
                             Debug.Assert(resource.AccessorInfo != null);
-                            resource.AccessorInfo.EndAwait();
+                            resource.AccessorInfo.EndAwait(task);
                         }
 
                         throw new DeadlockDetectedException(deadlockList);
+                    }
+
+                    foreach (var resource in task.resourceList)
+                    {
+                        Debug.Assert(resource.AccessorInfo != null);
+                        ExclusiveResource.AccessorInformation.GetAsyncLocalId();
                     }
 
                     task.tcs.Task.ContinueWith(_ =>
@@ -406,7 +407,7 @@ namespace Dev
                         foreach (var resource in task.resourceList)
                         {
                             Debug.Assert(resource.AccessorInfo != null);
-                            resource.AccessorInfo.EndAwait();
+                            resource.AccessorInfo.EndAwait(task);
                         }
                     });
                 }
