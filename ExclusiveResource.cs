@@ -1,10 +1,12 @@
-﻿using System;
+﻿using Microsoft.VisualBasic;
+using System;
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.Design;
 using System.Diagnostics;
+using System.Diagnostics.Contracts;
 using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
@@ -39,6 +41,7 @@ namespace Dev
                     await task2;
                     Console.WriteLine("333");
                 });
+            await Task.Delay(1000);
             task1.AsTask().ContinueWith(t =>
             {
                 if (t.Exception != null)
@@ -55,7 +58,7 @@ namespace Dev
                 new ExclusiveResource(),
             };
 
-            for (var i = 0; i < 3; ++i)
+            for (var i = 0; i < 1; ++i)
             {
                 var a = i % 2;
                 var b = 1 - (i % 2);
@@ -101,14 +104,7 @@ namespace Dev
 
     public sealed class ExclusiveResource
     {
-        public static volatile bool UseDebugInformation
-#if DEBUG
-            = true;
-#else
-            = false;
-#endif
-
-        public static volatile bool UseAccessorInformation
+        public static volatile bool DebugMode
 #if DEBUG
             = true;
 #else
@@ -118,23 +114,20 @@ namespace Dev
         private TaskCompletionSource<object?>? lastTcs;
 
         public DebugInformation? DebugInfo { get; }
-        internal AccessorInformation? AccessorInfo { get; }
+        internal DeadlockDetector.AccessorManager? AccessorManager => this.DebugInfo?.AccessorManager;
 
         public ExclusiveResource(
             [CallerFilePath] string filePath = "",
             [CallerLineNumber] int lineNumber = 0)
         {
-            this.DebugInfo = UseDebugInformation
-                ? new()
+            this.DebugInfo = DebugMode == false
+                ? null
+                : new()
                 {
                     FilePath = filePath,
                     LineNumber = lineNumber,
-                }
-                : null;
-
-            this.AccessorInfo = UseAccessorInformation
-                ? new()
-                : null;
+                    AccessorManager = new(this),
+                };
         }
 
         public override string? ToString()
@@ -158,57 +151,57 @@ namespace Dev
             if (resources == null)
                 throw new ArgumentNullException(nameof(resources));
 
-            var tcs = new TaskCompletionSource<object?>();
+            var task = new ExclusiveResourceTask(
+                new(),
+                resources
+                    .Where(e => e != null)
+                    .Distinct()
+                    .ToList(),
+                DeadlockDetector.Accessor.GetCurrent());
 
-            var resourceList = resources
-                .Where(e => e != null)
-                .Distinct()
-                .ToList();
+            DeadlockDetector.OnCreated(task);
 
-            var prevTask = Task.WhenAll(resourceList
-                .Select(resource =>
-                {
-                    resource.AccessorInfo?.Request(tcs.Task.Id);
-                    return Interlocked.Exchange(ref resource.lastTcs, tcs)?.Task;
-                })
+            var prevTask = Task.WhenAll(task.resourceList
+                .Select(resource => Interlocked.Exchange(ref resource.lastTcs, task.tcs)?.Task)
                 .Where(task => task != null)
                 .Cast<Task>());
 
             if (prevTask.IsCompleted == false)
-                prevTask.ContinueWith(_ => InvokeAsync(taskFactory, tcs, cancellationToken, resourceList));
+                prevTask.ContinueWith(_ => InvokeAsync(taskFactory, task, cancellationToken));
             else
-                InvokeAsync(taskFactory, tcs, cancellationToken, resourceList);
+                InvokeAsync(taskFactory, task, cancellationToken);
 
-            return new(tcs, resourceList);
+            return task;
         }
 
         private static async void InvokeAsync(
             Func<CancellationToken, ValueTask> taskFactory,
-            TaskCompletionSource<object?> tcs,
-            CancellationToken cancellationToken,
-            IReadOnlyList<ExclusiveResource> resourceList)
+            ExclusiveResourceTask task,
+            CancellationToken cancellationToken)
         {
+            Exception? exception = null;
             try
             {
-                foreach (var resource in resourceList)
-                    resource.AccessorInfo?.Assign(tcs.Task.Id);
+                DeadlockDetector.OnReady(task);
 
                 if (cancellationToken.IsCancellationRequested == false)
                     await taskFactory.Invoke(cancellationToken);
-
-                tcs.SetResult(null);
             }
             catch (Exception ex)
             {
-                tcs.SetException(ex);
+                exception = ex;
             }
             finally
             {
-                foreach (var resource in resourceList)
-                {
-                    resource.AccessorInfo?.Finish(tcs.Task.Id);
-                    Interlocked.CompareExchange(ref resource.lastTcs, null, tcs);
-                }
+                DeadlockDetector.OnFinish(task);
+
+                foreach (var resource in task.resourceList)
+                    Interlocked.CompareExchange(ref resource.lastTcs, null, task.tcs);
+
+                if (exception == null)
+                    task.tcs.SetResult(null);
+                else
+                    task.tcs.SetException(exception);
             }
         }
 
@@ -218,122 +211,183 @@ namespace Dev
             public int Id { get; } = Interlocked.Increment(ref LastId);
             public string FilePath { get; init; } = "";
             public int LineNumber { get; init; }
+            internal DeadlockDetector.AccessorManager? AccessorManager { get; init; }
             public override string ToString() => $"{Path.GetFileName(this.FilePath)}:{this.LineNumber}({this.Id})";
         }
 
-        internal sealed class AccessorInformation
+        internal static class DeadlockDetector
         {
-            private static readonly AsyncLocal<int> AsyncLocalId = new();
-            private static int LastAsyncLocalId;
-
-            private readonly Dictionary<int, TaskState> taskMap = new();
-
-            public static int GetAsyncLocalId()
+            internal sealed class Accessor
             {
-                if (AsyncLocalId.Value == 0)
+                private static readonly AsyncLocal<Accessor> AsyncLocal = new();
+                private static int lastId;
+                public static Accessor? GetCurrent()
                 {
-                    lock (AsyncLocalId)
+                    if (DebugMode == false)
+                        return null;
+
+                    if (AsyncLocal.Value == null)
                     {
-                        if (AsyncLocalId.Value == 0)
-                            AsyncLocalId.Value = ++LastAsyncLocalId;
-                    }
-                }
-
-                return AsyncLocalId.Value;
-            }
-
-            public void Request(int taskId)
-            {
-                var asyncLocalId = GetAsyncLocalId();
-                lock (this.taskMap)
-                {
-                    Debug.Assert(this.taskMap.ContainsKey(taskId) == false);
-                    this.taskMap[taskId] = new() { AsyncLocalId = asyncLocalId };
-                }
-            }
-
-            public void Assign(int taskId)
-            {
-                lock (this.taskMap)
-                {
-                    if (this.taskMap.TryGetValue(taskId, out var state) == false)
-                    {
-                        Debug.Fail($"{nameof(TaskState)} not found. id:{taskId}");
-                        return;
+                        lock (AsyncLocal)
+                        {
+                            if (AsyncLocal.Value == null)
+                                AsyncLocal.Value = new(++lastId);
+                        }
                     }
 
-                    state.AllocationState = AllocationState.Assigned;
+                    return AsyncLocal.Value;
                 }
+
+                public readonly int Id;
+                public readonly ConcurrentDictionary<int, ExclusiveResourceTask> TaskMap = new();
+                private Accessor(int id) => this.Id = id;
+                public override string ToString() => this.Id.ToString();
             }
 
-            public void Finish(int taskId)
+            internal sealed class AccessorManager
             {
-                lock (this.taskMap)
+                public readonly ExclusiveResource Resource;
+                public ExclusiveResourceTaskRef? AssignedTo;
+                public AccessorManager(ExclusiveResource resource) => this.Resource = resource;
+                public override string? ToString() => this.Resource.ToString();
+                internal sealed class ExclusiveResourceTaskRef
                 {
-                    var removed = this.taskMap.Remove(taskId);
-                    Debug.Assert(removed);
+                    public ExclusiveResourceTask Task { get; init; }
                 }
             }
 
-            public bool BeginAwait(ExclusiveResourceTask task)
+            public static void OnCreated(ExclusiveResourceTask task)
             {
-                var asyncLocalId = GetAsyncLocalId();
-                lock (this.taskMap)
+                var accessor = task.accessor;
+                if (accessor == null)
+                    return;
+
+                Debug.Assert(DebugMode);
+
+                var added = accessor.TaskMap.TryAdd(task.Id, task);
+                Debug.Assert(added);
+            }
+
+            public static void OnReady(ExclusiveResourceTask task)
+            {
+                var accessor = task.accessor;
+                if (accessor == null)
+                    return;
+
+                Debug.Assert(DebugMode);
+
+                foreach (var resource in task.ResourceList)
                 {
-                    if (this.taskMap.TryGetValue(task.Id, out var state) == false)
-                        return task.IsCompleted;
+                    var am = resource.AccessorManager;
+                    Debug.Assert(am != null);
 
-                    var isSelfDeadlock = this.taskMap.Any(kv
-                        => kv.Key != task.Id
-                        && kv.Value.AllocationState == AllocationState.Assigned
-                        && kv.Value.AsyncLocalId == asyncLocalId);
-                    if (isSelfDeadlock)
-                        return task.IsCompleted;
-
-                    if (state.Awaiters.Contains(asyncLocalId))
-                        return false;
-
-                    state.Awaiters.Add(asyncLocalId);
-                    return true;
+                    var exchanged = Interlocked.CompareExchange(
+                        ref am.AssignedTo,
+                        new() { Task = task },
+                        null);
+                    Debug.Assert(exchanged == null);
                 }
             }
 
-            public void EndAwait(ExclusiveResourceTask task)
+            public static void OnFinish(ExclusiveResourceTask task)
             {
-                var asyncLocalId = GetAsyncLocalId();
-                lock (this.taskMap)
+                var accessor = task.accessor;
+                if (accessor == null)
+                    return;
+
+                Debug.Assert(DebugMode);
+
+                var removed = accessor.TaskMap.TryRemove(new(task.Id, task));
+                Debug.Assert(removed);
+
+                foreach (var resource in task.ResourceList)
                 {
-                    if (this.taskMap.TryGetValue(task.Id, out var state))
-                        state.Awaiters.Remove(asyncLocalId);
-                    else
-                        Debug.Assert(task.IsCompleted);
+                    var am = resource.AccessorManager;
+                    Debug.Assert(am != null);
+
+                    var oldRef = am.AssignedTo;
+                    if (oldRef == null || oldRef.Task != task)
+                    {
+                        Debug.Fail($"task mismatch. task:{task}, assigned:{oldRef}");
+                        continue;
+                    }
+
+                    var exchanged = Interlocked.CompareExchange(ref am.AssignedTo, null, oldRef);
+                    Debug.Assert(exchanged == oldRef);
                 }
             }
 
-            private sealed class TaskState
+            public static IReadOnlyList<ExclusiveResource> CheckDeadlock(ExclusiveResourceTask task)
             {
-                public int AsyncLocalId { get; init; }
-                public AllocationState AllocationState { get; set; }
-                public List<int> Awaiters { get; } = new();
-            }
+                Debug.Assert(DebugMode);
+                Debug.Assert(task.accessor != null);
+                return TraversialRAG(task, new())
+                    ?? Array.Empty<ExclusiveResource>();
 
-            private enum AllocationState
-            {
-                Requested,
-                Assigned,
+                static IReadOnlyList<ExclusiveResource>? TraversialRAG(
+                    ExclusiveResourceTask task,
+                    List<ExclusiveResource> footprints)
+                {
+                    var nextNodes = task.ResourceList
+                        .Select(resource =>
+                        {
+                            var am = resource.AccessorManager;
+                            Debug.Assert(am != null);
+                            return (
+                                Resource: am.Resource,
+                                AssignedTo: Volatile.Read(ref am.AssignedTo));
+                        })
+                        .Where(e => e.AssignedTo != null && e.AssignedTo.Task != task)
+                        .ToList();
+
+                    foreach (var node in nextNodes)
+                    {
+                        if (AddFootprint(footprints, node.Resource) == false)
+                            return footprints;
+                    }
+
+                    foreach (var node in nextNodes)
+                    {
+                        Debug.Assert(node.AssignedTo != null);
+
+                        var nextAccessor = node.AssignedTo.Task.accessor;
+                        Debug.Assert(nextAccessor != null);
+
+                        foreach (var nextTask in nextAccessor.TaskMap.Values)
+                        {
+                            var dectected = TraversialRAG(nextTask, new(footprints));
+                            if (dectected != null)
+                                return dectected;
+                        }
+                    }
+
+                    return null;
+                }
+
+                static bool AddFootprint(List<ExclusiveResource> footprints, ExclusiveResource resource)
+                {
+                    var detectedCircularRef = footprints.Contains(resource);
+                    footprints.Add(resource);
+                    return detectedCircularRef == false;
+                }
             }
         }
     }
 
     public readonly struct ExclusiveResourceTask : IEquatable<ExclusiveResourceTask>
     {
-        private readonly TaskCompletionSource<object?> tcs;
-        private readonly IReadOnlyList<ExclusiveResource> resourceList;
+        internal readonly TaskCompletionSource<object?> tcs;
+        internal readonly IReadOnlyList<ExclusiveResource> resourceList;
+        internal readonly ExclusiveResource.DeadlockDetector.Accessor? accessor;
 
-        internal ExclusiveResourceTask(TaskCompletionSource<object?> tcs, IReadOnlyList<ExclusiveResource> resourceList)
+        internal ExclusiveResourceTask(
+            TaskCompletionSource<object?> tcs,
+            IReadOnlyList<ExclusiveResource> resourceList,
+            ExclusiveResource.DeadlockDetector.Accessor? accessor)
         {
             this.tcs = tcs;
             this.resourceList = resourceList;
+            this.accessor = accessor;
         }
 
         public int Id => this.tcs?.Task.Id ?? Task.CompletedTask.Id;
@@ -373,43 +427,11 @@ namespace Dev
             {
                 this.tcs = task.tcs;
 
-                if (task.resourceList != null && task.tcs != null && ExclusiveResource.UseAccessorInformation)
+                if (task.resourceList != null && task.tcs != null && ExclusiveResource.DebugMode)
                 {
-                    var deadlockList = task.resourceList
-                        .Select(resource =>
-                        {
-                            Debug.Assert(resource.AccessorInfo != null);
-                            return (resource, result: resource.AccessorInfo.BeginAwait(task));
-                        })
-                        .Where(e => e.result == false)
-                        .Select(e => e.resource)
-                        .ToList();
-
+                    var deadlockList = ExclusiveResource.DeadlockDetector.CheckDeadlock(task);
                     if (deadlockList.Count != 0)
-                    {
-                        foreach (var resource in task.resourceList.Where(e => deadlockList.Contains(e) == false))
-                        {
-                            Debug.Assert(resource.AccessorInfo != null);
-                            resource.AccessorInfo.EndAwait(task);
-                        }
-
                         throw new DeadlockDetectedException(deadlockList);
-                    }
-
-                    foreach (var resource in task.resourceList)
-                    {
-                        Debug.Assert(resource.AccessorInfo != null);
-                        ExclusiveResource.AccessorInformation.GetAsyncLocalId();
-                    }
-
-                    task.tcs.Task.ContinueWith(_ =>
-                    {
-                        foreach (var resource in task.resourceList)
-                        {
-                            Debug.Assert(resource.AccessorInfo != null);
-                            resource.AccessorInfo.EndAwait(task);
-                        }
-                    });
                 }
             }
 
@@ -422,6 +444,7 @@ namespace Dev
         public sealed class DeadlockDetectedException : Exception
         {
             public DeadlockDetectedException(IReadOnlyList<ExclusiveResource> deadlockResourceList)
+                : base($"deadlock detected. {string.Join(" -> ", deadlockResourceList)}")
             {
                 this.ResourceList = deadlockResourceList;
             }
