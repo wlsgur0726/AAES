@@ -38,9 +38,9 @@ namespace Lib.Test
                             shuffledResources[swapIdx] = temp;
                         }
 
-                        lastTask = ExclusiveResource.AwaitableAccess(
-                            shuffledResources,
-                            () => default);
+                        lastTask = ExclusiveResource
+                            .AccessTo(shuffledResources)
+                            .ThenAsync(_ => default);
 
                     } while (DateTime.UtcNow - startedAt < testTime);
 
@@ -57,23 +57,21 @@ namespace Lib.Test
                 new ExclusiveResource(),
             };
 
-            var task = ExclusiveResource.AwaitableAccess(
-                resources,
-                async () =>
+            var task = ExclusiveResource.AccessTo(resources).ThenAsync(async _ =>
+            {
+                Console.WriteLine("111");
+                var innerTask = resources[1].Access.ThenAsync(async _ =>
                 {
-                    Console.WriteLine("111");
-                    var innerTask = resources[1].AwaitableAccess(async () =>
-                    {
-                        await Task.Delay(1);
-                        Console.WriteLine("222");
-                    });
-                    await Assert.ThrowsAsync(
-                        ExclusiveResource.DebugLevel >= 1
-                            ? typeof(ExclusiveResource.DeadlockDetectedException)
-                            : typeof(TimeoutException),
-                        () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500)));
-                    Console.WriteLine("333");
+                    await Task.Delay(1);
+                    Console.WriteLine("222");
                 });
+                await Assert.ThrowsAsync(
+                    ExclusiveResource.DebugLevel >= 1
+                        ? typeof(ExclusiveResource.DeadlockDetectedException)
+                        : typeof(TimeoutException),
+                    () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500)));
+                Console.WriteLine("333");
+            });
 
             await task.AsTask().WaitAsync(TimeSpan.FromMilliseconds(1000));
         }
@@ -96,7 +94,7 @@ namespace Lib.Test
                     new TaskCompletionSource<object?>(),
                 };
 
-                var task1 = resources[a].AwaitableAccess(async () =>
+                var task1 = resources[a].Access.ThenAsync(async _ =>
                 {
                     Console.WriteLine("a");
 
@@ -105,7 +103,7 @@ namespace Lib.Test
 
                     // task2보다 먼저 await를 시도하므로 순환을 감지하지 못한다.
                     // (task2가 미래에 무엇을 await할지 예측 불가)
-                    var innerTask = resources[b].AwaitableAccess(() =>
+                    var innerTask = resources[b].Access.ThenAsync(_ =>
                     {
                         // task2가 exception으로 인해 종료되면 실행된다.
                         Console.WriteLine("and b");
@@ -117,7 +115,7 @@ namespace Lib.Test
                     Console.WriteLine("a fin");
                 });
 
-                var task2 = resources[b].AwaitableAccess(async () =>
+                var task2 = resources[b].Access.ThenAsync(async _ =>
                 {
                     Console.WriteLine("b");
 
@@ -127,7 +125,7 @@ namespace Lib.Test
                     // task1이 await 중인 상태에서 시도하므로 데드락.
                     // DebugLevel이 활성화 되어있으면 즉시 감지되어야 한다.
                     // DebugLevel 비활성에 타임아웃 처리도 하지 않는다면 관련 task들은 영원히 종료되지 않는다.
-                    var innerTask = resources[a].AwaitableAccess(() =>
+                    var innerTask = resources[a].Access.ThenAsync(_ =>
                     {
                         // 데드락 여부와 무관하게 예약은 무조건 이뤄지므로 데드락이 해결되면 이 함수도 실행된다.
                         // 본 예제는 task2가 exception으로 인해 종료되고, 그로 인해 task1이 종료된 후 점유 성공한다.
@@ -158,26 +156,26 @@ namespace Lib.Test
                 new ExclusiveResource(),
             };
 
-            var t01 = resources[0].AwaitableAccess(async () =>
+            var t01 = resources[0].Access.ThenAsync(async _ =>
             {
                 await Task.Delay(100);
                 Console.WriteLine("t01");
             });
 
-            var t11 = resources[1].AwaitableAccess(async () =>
+            var t11 = resources[1].Access.ThenAsync(async _ =>
             {
                 await Task.Delay(100);
                 Console.WriteLine("t11");
             });
 
-            var t02 = resources[0].AwaitableAccess(async () =>
+            var t02 = resources[0].Access.ThenAsync(async _ =>
             {
                 //await Task.Delay(100);
                 await t11;
                 Console.WriteLine("t02");
             });
 
-            var t12 = resources[1].AwaitableAccess(async () =>
+            var t12 = resources[1].Access.ThenAsync(async _ =>
             {
                 //await Task.Delay(100);
                 await t01;
@@ -193,8 +191,8 @@ namespace Lib.Test
                 t12.AsTask());
         }
 
-        //[Fact]
         #pragma warning disable xUnit1013 
+        //[Fact]
         public static async Task UnhandledException()
         #pragma warning restore xUnit1013 
         {
@@ -211,7 +209,7 @@ namespace Lib.Test
                 AppDomain.CurrentDomain.UnhandledException += handler;
                 ThreadPool.UnsafeQueueUserWorkItem(_ =>
                 {
-                    new ExclusiveResource().Access(() => throw new InvalidOperationException(expectedMessage));
+                    new ExclusiveResource().Access.Then(_ => throw new InvalidOperationException(expectedMessage));
                 }, null);
 
                 var message = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(1));

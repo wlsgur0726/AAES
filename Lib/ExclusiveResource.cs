@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -39,57 +40,26 @@ namespace Lib
             [CallerFilePath] string filePath = "",
             [CallerLineNumber] int lineNumber = 0)
         {
-            this.DebugInfo = DebugLevel >= 1 ? new(filePath, lineNumber) : null;
+            if (DebugLevel >= 1)
+                this.DebugInfo = new(filePath, lineNumber);
         }
 
         public override string ToString() => this.DebugInfo == null
             ? $"{nameof(ExclusiveResource)}({this.Id})"
             : $"{nameof(ExclusiveResource)}:{this.DebugInfo}({this.Id})";
 
-        public void Access(Func<ValueTask> taskFactory)
-        {
-            Access(new[] { this }, taskFactory);
-        }
-
-        public ExclusiveResourceTask AwaitableAccess(Func<ValueTask> taskFactory)
-        {
-            return AwaitableAccess(new[] { this }, taskFactory);
-        }
-
-        public ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(Func<ValueTask<TResult?>> taskFactory)
-        {
-            return AwaitableAccess(new[] { this }, taskFactory);
-        }
-
-        public static void Access(
-            IEnumerable<ExclusiveResource> resources,
-            Func<ValueTask> taskFactory)
-        {
-            AwaitableAccess(resources, taskFactory).Forget();
-        }
-
-        public static ExclusiveResourceTask AwaitableAccess(
-            IEnumerable<ExclusiveResource> resources,
-            Func<ValueTask> taskFactory)
-        {
-            if (taskFactory == null)
-                throw new ArgumentException(nameof(taskFactory));
-
-            return AwaitableAccess<object?>(
-                resources,
-                async () =>
-                {
-                    await taskFactory.Invoke();
-                    return null;
-                });
-        }
+        public AccessTrigger Access => new(new[] { this });
+        public static AccessTrigger AccessTo(params ExclusiveResource[] resources) => new(resources);
+        public static AccessTrigger AccessTo(IEnumerable<ExclusiveResource> resources) => new(resources);
 
         public static ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(
             IEnumerable<ExclusiveResource> resources,
-            Func<ValueTask<TResult?>> taskFactory)
+            CancellationOption cancellationOption,
+            TimeSpan? waitingTimeout,
+            Func<CancellationToken, ValueTask<TResult?>> taskFactory)
         {
             if (taskFactory == null)
-                throw new ArgumentException(nameof(taskFactory));
+                throw new ArgumentNullException(nameof(taskFactory));
 
             if (resources == null)
                 throw new ArgumentNullException(nameof(resources));
@@ -116,9 +86,16 @@ namespace Lib
             }
 
             if (previousTask.IsCompleted)
-                InvokeAsync(taskFactory, task);
+            {
+                InvokeAsync(taskFactory, null, cancellationOption, task);
+            }
             else
-                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, task));
+            {
+                var waitingTimeoutTimer = waitingTimeout.HasValue
+                    ? new WaitingTimeoutTimer<TResult>(task, waitingTimeout.Value)
+                    : null;
+                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, waitingTimeoutTimer, cancellationOption, task));
+            }
 
             return task;
         }
@@ -197,9 +174,9 @@ namespace Lib
                 Debug.Assert(t == Locked);
             }
 
-            #pragma warning disable CS8620
+#pragma warning disable CS8620
             var previousTaskSet = new HashSet<Task>(exchangeds.Where(e => e != null));
-            #pragma warning restore CS8620
+#pragma warning restore CS8620
             previousTask = previousTaskSet.Count switch
             {
                 0 => Task.CompletedTask,
@@ -209,16 +186,33 @@ namespace Lib
         }
 
         private static async void InvokeAsync<TResult>(
-            Func<ValueTask<TResult?>> taskFactory,
+            Func<CancellationToken, ValueTask<TResult?>> taskFactory,
+            WaitingTimeoutTimer<TResult>? waitingTimeoutTimer,
+            CancellationOption cancellationOption,
             ExclusiveResourceTask<TResult?> task)
         {
-            Exception? exception = null;
+            bool isWaitingTimeout = false;
             TResult? result = default;
+            Exception? exception = null;
             try
             {
                 DeadlockDetector.BeginTask(task);
 
-                result = await taskFactory.Invoke();
+                if (waitingTimeoutTimer != null && waitingTimeoutTimer.TryCancel() == false)
+                {
+                    isWaitingTimeout = true;
+                    return;
+                }
+
+                if (cancellationOption.Token.IsCancellationRequested)
+                {
+                    if (cancellationOption.SuppressException)
+                        return;
+                    else
+                        throw new OperationCanceledException(cancellationOption.Token);
+                }
+
+                result = await taskFactory.Invoke(cancellationOption.Token);
             }
             catch (Exception ex)
             {
@@ -234,10 +228,115 @@ namespace Lib
                     Debug.Assert(exchanged != null);
                 }
 
-                if (exception == null)
-                    task.Tcs.SetResult(result);
-                else
-                    task.Tcs.SetException(exception);
+                if (exception != null)
+                    task.Tcs.TrySetException(exception);
+                else if (isWaitingTimeout == false)
+                    task.Tcs.TrySetResult(result);
+            }
+        }
+
+        public ref struct AccessTrigger
+        {
+            private IEnumerable<ExclusiveResource> resources;
+            private CancellationOption cancellationOption;
+            private TimeSpan? waitingTimeout;
+
+            internal AccessTrigger(IEnumerable<ExclusiveResource> resources)
+            {
+                this.resources = resources;
+                this.cancellationOption = default;
+                this.waitingTimeout = null;
+            }
+
+            public AccessTrigger WithCancellationOption(CancellationOption option)
+            {
+                this.cancellationOption = option;
+                return this;
+            }
+
+            public AccessTrigger WithWaitingTimeout(TimeSpan timeout)
+            {
+                this.waitingTimeout = timeout;
+                return this;
+            }
+
+            public void Then(Func<CancellationToken, ValueTask> taskFactory)
+            {
+                this.ThenAsync(taskFactory).Forget();
+            }
+
+            public ExclusiveResourceTask ThenAsync(Func<CancellationToken, ValueTask> taskFactory)
+            {
+                if (taskFactory == null)
+                    throw new ArgumentNullException(nameof(taskFactory));
+
+                return this.ThenAsync<object>(async ct =>
+                {
+                    await taskFactory.Invoke(ct);
+                    return null;
+                });
+            }
+
+            public ExclusiveResourceTask<TResult?> ThenAsync<TResult>(Func<CancellationToken, ValueTask<TResult?>> taskFactory)
+            {
+                return AwaitableAccess(
+                    resources: this.resources,
+                    cancellationOption: this.cancellationOption,
+                    waitingTimeout: this.waitingTimeout,
+                    taskFactory: taskFactory);
+            }
+        }
+
+        public readonly struct CancellationOption
+        {
+            public CancellationToken Token { get; init; }
+            public bool SuppressException { get; init; } 
+        }
+
+        private sealed class WaitingTimeoutTimer<TResult>
+        {
+            private readonly CancellationTokenSource cts = new();
+            private int result;
+
+            public WaitingTimeoutTimer(ExclusiveResourceTask<TResult?> task, TimeSpan timeout)
+            {
+                this.Start(task, timeout);
+            }
+
+            public bool TryCancel()
+            {
+                if (0 != Interlocked.CompareExchange(ref this.result, 1, 0))
+                    return false;
+
+                try
+                {
+                    this.cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                return true;
+            }
+
+            private async void Start(ExclusiveResourceTask<TResult?> task, TimeSpan timeout)
+            {
+                try
+                {
+                    await Task.Delay(timeout, this.cts.Token);
+
+                    if (0 == Interlocked.CompareExchange(ref this.result, 2, 0))
+                        task.Tcs.TrySetException(new WaitingTimeoutException(task.DebugInfo?.PreviousTask));
+                }
+                catch (OperationCanceledException e) when (e.CancellationToken == this.cts.Token)
+                {
+                    Debug.Assert(this.result == 1);
+                }
+                finally
+                {
+                    Debug.Assert(this.result != 0);
+                    this.cts.Dispose();
+                }
             }
         }
 
@@ -249,8 +348,8 @@ namespace Lib
 
             internal DebugInformation(string filePath, int lineNumber)
             {
-                FilePath = filePath;
-                LineNumber = lineNumber;
+                this.FilePath = filePath;
+                this.LineNumber = lineNumber;
             }
 
             public override string ToString()
@@ -507,7 +606,7 @@ namespace Lib
             }
         }
 
-        public sealed class DeadlockDetectedException : Exception
+        public class DeadlockDetectedException : Exception
         {
             public DeadlockDetectedException(IReadOnlyList<object> deadlockNodeList)
                 : base(new StringBuilder()
@@ -520,134 +619,17 @@ namespace Lib
 
             public IReadOnlyList<object> DeadlockNodeList { get; }
         }
-    }
 
-    public abstract class ExclusiveResourceTask
-    {
-        internal ExclusiveResourceTask(
-            Task internalTask,
-            IReadOnlyList<ExclusiveResource> resourceList,
-            Task previousTask,
-            ExclusiveResource.DeadlockDetector.Invoker? parent)
+        public class WaitingTimeoutException : TimeoutException
         {
-            this.InternalTask = internalTask;
-            this.ResourceList = resourceList;
-            this.DebugInfo = parent == null ? null : new(parent, previousTask);
-            Debug.Assert((parent != null) == (ExclusiveResource.DebugLevel >= 1));
-        }
-
-        public int Id => this.InternalTask.Id;
-        public AggregateException? Exception => this.InternalTask.Exception;
-        public bool IsFaulted => this.InternalTask.IsFaulted;
-        public bool IsCompleted => this.InternalTask.IsCompleted;
-        public bool IsCanceled => this.InternalTask.IsCanceled;
-        public bool IsCompletedSuccessfully => this.InternalTask.IsCompletedSuccessfully;
-        public IReadOnlyList<ExclusiveResource> ResourceList { get; }
-
-        internal Task InternalTask { get; }
-        internal DebugInformation? DebugInfo { get; }
-
-        public override string ToString()
-            => $"{nameof(ExclusiveResourceTask)}({this.Id})";
-
-        public Awaiter GetAwaiter()
-        {
-            return new(this);
-        }
-
-        public Task AsTask()
-        {
-            return this.DebugInfo != null
-                ? WrapForDeadlockDetector(this)
-                : this.InternalTask;
-
-            static async Task WrapForDeadlockDetector(ExclusiveResourceTask current) => await current;
-        }
-
-        internal async void Forget()
-        {
-            /// for <see cref="UnhandledExceptionEventHandler"/>
-            await this.InternalTask;
-        }
-
-        public readonly struct Awaiter : INotifyCompletion, ICriticalNotifyCompletion
-        {
-            private readonly Task internalTask;
-
-            internal Awaiter(ExclusiveResourceTask task)
+            public WaitingTimeoutException(Task? previousTask)
+                : base(previousTask == null ? null : $"PreviousTask.Id is {previousTask.Id}")
             {
-                this.internalTask = task.InternalTask;
-                if (task.DebugInfo != null)
-                    ExclusiveResource.DeadlockDetector.CheckDeadlock(task);
-            }
-
-            public bool IsCompleted => this.internalTask.IsCompleted;
-            public void OnCompleted(Action continuation) => this.internalTask.GetAwaiter().OnCompleted(continuation);
-            public void UnsafeOnCompleted(Action continuation) => this.internalTask.GetAwaiter().UnsafeOnCompleted(continuation);
-            public void GetResult() => this.internalTask.GetAwaiter().GetResult();
-        }
-
-        internal sealed class DebugInformation
-        {
-            public ExclusiveResource.DeadlockDetector.Invoker Parent { get; }
-            public ExclusiveResource.DeadlockDetector.Invoker? Invoker { get; set; }
-            public Task PreviousTask { get; }
-
-            public DebugInformation(
-                ExclusiveResource.DeadlockDetector.Invoker parent,
-                Task previousTask)
-            {
-                this.Parent = parent;
+                Debug.Assert((previousTask != null) == (DebugLevel >= 1));
                 this.PreviousTask = previousTask;
             }
-        }
-    }
 
-    public class ExclusiveResourceTask<TResult> : ExclusiveResourceTask
-    {
-        private readonly TaskCompletionSource<TResult?> tcs;
-
-        internal ExclusiveResourceTask(
-            TaskCompletionSource<TResult?> tcs,
-            IReadOnlyList<ExclusiveResource> resourceList,
-            Task previousTask,
-            ExclusiveResource.DeadlockDetector.Invoker? parent)
-            : base(tcs.Task, resourceList, previousTask, parent)
-        {
-            this.tcs = tcs;
-        }
-
-        internal TaskCompletionSource<TResult?> Tcs => this.tcs;
-
-        new public Task<TResult?> AsTask()
-        {
-            return this.DebugInfo != null
-                ? WrapForDeadlockDetector(this)
-                : this.tcs.Task;
-
-            static async Task<TResult?> WrapForDeadlockDetector(ExclusiveResourceTask<TResult?> current) => await current;
-        }
-
-        new public ResultAwaiter GetAwaiter()
-        {
-            return new(this);
-        }
-
-        public readonly struct ResultAwaiter : INotifyCompletion, ICriticalNotifyCompletion
-        {
-            private readonly Task<TResult?> internalTask;
-
-            internal ResultAwaiter(ExclusiveResourceTask<TResult?> task)
-            {
-                this.internalTask = task.tcs.Task;
-                if (task.DebugInfo != null)
-                    ExclusiveResource.DeadlockDetector.CheckDeadlock(task);
-            }
-
-            public bool IsCompleted => this.internalTask.IsCompleted;
-            public void OnCompleted(Action continuation) => this.internalTask.GetAwaiter().OnCompleted(continuation);
-            public void UnsafeOnCompleted(Action continuation) => this.internalTask.GetAwaiter().UnsafeOnCompleted(continuation);
-            public TResult? GetResult() => this.internalTask.GetAwaiter().GetResult();
+            public Task? PreviousTask { get; }
         }
     }
 
