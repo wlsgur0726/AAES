@@ -40,8 +40,7 @@ namespace Lib.Test
 
                         lastTask = ExclusiveResource.AwaitableAccess(
                             shuffledResources,
-                            default,
-                            _ => default);
+                            () => default);
 
                     } while (DateTime.UtcNow - startedAt < testTime);
 
@@ -60,11 +59,10 @@ namespace Lib.Test
 
             var task = ExclusiveResource.AwaitableAccess(
                 resources,
-                default,
-                async _ =>
+                async () =>
                 {
                     Console.WriteLine("111");
-                    var innerTask = resources[1].AwaitableAccess(default, async _ =>
+                    var innerTask = resources[1].AwaitableAccess(async () =>
                     {
                         await Task.Delay(1);
                         Console.WriteLine("222");
@@ -98,7 +96,7 @@ namespace Lib.Test
                     new TaskCompletionSource<object?>(),
                 };
 
-                var task1 = resources[a].AwaitableAccess(default, async _ =>
+                var task1 = resources[a].AwaitableAccess(async () =>
                 {
                     Console.WriteLine("a");
 
@@ -107,7 +105,7 @@ namespace Lib.Test
 
                     // task2보다 먼저 await를 시도하므로 순환을 감지하지 못한다.
                     // (task2가 미래에 무엇을 await할지 예측 불가)
-                    var innerTask = resources[b].AwaitableAccess(default, _ =>
+                    var innerTask = resources[b].AwaitableAccess(() =>
                     {
                         // task2가 exception으로 인해 종료되면 실행된다.
                         Console.WriteLine("and b");
@@ -119,7 +117,7 @@ namespace Lib.Test
                     Console.WriteLine("a fin");
                 });
 
-                var task2 = resources[b].AwaitableAccess(default, async _ =>
+                var task2 = resources[b].AwaitableAccess(async () =>
                 {
                     Console.WriteLine("b");
 
@@ -129,7 +127,7 @@ namespace Lib.Test
                     // task1이 await 중인 상태에서 시도하므로 데드락.
                     // DebugLevel이 활성화 되어있으면 즉시 감지되어야 한다.
                     // DebugLevel 비활성에 타임아웃 처리도 하지 않는다면 관련 task들은 영원히 종료되지 않는다.
-                    var innerTask = resources[a].AwaitableAccess(default, _ =>
+                    var innerTask = resources[a].AwaitableAccess(() =>
                     {
                         // 데드락 여부와 무관하게 예약은 무조건 이뤄지므로 데드락이 해결되면 이 함수도 실행된다.
                         // 본 예제는 task2가 exception으로 인해 종료되고, 그로 인해 task1이 종료된 후 점유 성공한다.
@@ -160,26 +158,26 @@ namespace Lib.Test
                 new ExclusiveResource(),
             };
 
-            var t01 = resources[0].AwaitableAccess(default, async _ =>
+            var t01 = resources[0].AwaitableAccess(async () =>
             {
                 await Task.Delay(100);
                 Console.WriteLine("t01");
             });
 
-            var t11 = resources[1].AwaitableAccess(default, async _ =>
+            var t11 = resources[1].AwaitableAccess(async () =>
             {
                 await Task.Delay(100);
                 Console.WriteLine("t11");
             });
 
-            var t02 = resources[0].AwaitableAccess(default, async _ =>
+            var t02 = resources[0].AwaitableAccess(async () =>
             {
                 //await Task.Delay(100);
                 await t11;
                 Console.WriteLine("t02");
             });
 
-            var t12 = resources[1].AwaitableAccess(default, async _ =>
+            var t12 = resources[1].AwaitableAccess(async () =>
             {
                 //await Task.Delay(100);
                 await t01;
@@ -196,7 +194,9 @@ namespace Lib.Test
         }
 
         //[Fact]
+        #pragma warning disable xUnit1013 
         public static async Task UnhandledException()
+        #pragma warning restore xUnit1013 
         {
             var expectedMessage = $"test {nameof(UnhandledException)} for Forget method. {DateTime.UtcNow.Ticks}";
             var tcs = new TaskCompletionSource<string?>();
@@ -211,9 +211,7 @@ namespace Lib.Test
                 AppDomain.CurrentDomain.UnhandledException += handler;
                 ThreadPool.UnsafeQueueUserWorkItem(_ =>
                 {
-                    new ExclusiveResource().Access(
-                        default,
-                        _ => throw new InvalidOperationException(expectedMessage));
+                    new ExclusiveResource().Access(() => throw new InvalidOperationException(expectedMessage));
                 }, null);
 
                 var message = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(1));

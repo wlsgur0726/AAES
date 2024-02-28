@@ -13,7 +13,7 @@ namespace Lib.Test
         public static void LikeActorModel()
         {
             var resource = new ExclusiveResource();
-            resource.Access(default, async _ =>
+            resource.Access(async () =>
             {
                 await Task.Yield();
                 Console.WriteLine("do somthing");
@@ -24,7 +24,7 @@ namespace Lib.Test
         public static async Task AwaitableAccess()
         {
             var resource = new ExclusiveResource();
-            var result = await resource.AwaitableAccess(default, async _ =>
+            var result = await resource.AwaitableAccess(async () =>
             {
                 await Task.Delay(100);
                 return 123;
@@ -38,20 +38,20 @@ namespace Lib.Test
             var resource = new ExclusiveResource();
 
             var tcs = new TaskCompletionSource<object?>();
-            resource.Access(default, async _ =>
+            resource.Access(async () =>
             {
                 await Task.Delay(500);
                 tcs.SetResult(null);
             });
             Assert.False(tcs.Task.IsCompleted);
 
-            var footprints = await resource.AwaitableAccess(default, async _ =>
+            var footprints = await resource.AwaitableAccess(async () =>
             {
                 var footprints = new List<int>();
 
                 footprints.Add(1);
 
-                resource.Access(default, _ =>
+                resource.Access(() =>
                 {
                     footprints.Add(2);
                     return default;
@@ -67,7 +67,7 @@ namespace Lib.Test
             Assert.True(tcs.Task.IsCompleted);
 
             // wait for flush ...
-            await resource.AwaitableAccess(default, _ => default);
+            await resource.AwaitableAccess(() => default);
 
             Assert.Equal(new[] { 1, 3, 2 }, footprints);
         }
@@ -85,7 +85,7 @@ namespace Lib.Test
 
             foreach (var number in expectedList)
             {
-                resource.Access(default, _ =>
+                resource.Access(() =>
                 {
                     actualList.Add(number);
                     return default;
@@ -93,7 +93,7 @@ namespace Lib.Test
             }
 
             // wait for flush ...
-            await resource.AwaitableAccess(default, _ => default);
+            await resource.AwaitableAccess(() => default);
 
             Assert.Equal(expectedList, actualList);
         }
@@ -113,7 +113,7 @@ namespace Lib.Test
                 {
                     for (var i = 0; i < accessCount; i++)
                     {
-                        resource.Access(default, _ =>
+                        resource.Access(() =>
                         {
                             number++;
                             return default;
@@ -126,7 +126,7 @@ namespace Lib.Test
             threads.ForEach(t => t.Join());
 
             // wait for flush ...
-            await resource.AwaitableAccess(default, _ => default);
+            await resource.AwaitableAccess(() => default);
 
             Assert.Equal(threadCount * accessCount, number);
         }
@@ -140,8 +140,7 @@ namespace Lib.Test
 
             ExclusiveResource.Access(
                 new[] { resource1, resource2, resource3 },
-                default,
-                async _ =>
+                async () =>
                 {
                     await Task.Yield();
                     Console.WriteLine("do somthing");

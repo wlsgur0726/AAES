@@ -46,57 +46,47 @@ namespace Lib
             ? $"{nameof(ExclusiveResource)}({this.Id})"
             : $"{nameof(ExclusiveResource)}:{this.DebugInfo}({this.Id})";
 
-        public void Access(
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask> taskFactory)
+        public void Access(Func<ValueTask> taskFactory)
         {
-            Access(new[] { this }, cancellationToken, taskFactory);
+            Access(new[] { this }, taskFactory);
         }
 
-        public ExclusiveResourceTask AwaitableAccess(
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask> taskFactory)
+        public ExclusiveResourceTask AwaitableAccess(Func<ValueTask> taskFactory)
         {
-            return AwaitableAccess(new[] { this }, cancellationToken, taskFactory);
+            return AwaitableAccess(new[] { this }, taskFactory);
         }
 
-        public ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask<TResult?>> taskFactory)
+        public ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(Func<ValueTask<TResult?>> taskFactory)
         {
-            return AwaitableAccess(new[] { this }, cancellationToken, taskFactory);
+            return AwaitableAccess(new[] { this }, taskFactory);
         }
 
         public static void Access(
             IEnumerable<ExclusiveResource> resources,
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask> taskFactory)
+            Func<ValueTask> taskFactory)
         {
-            AwaitableAccess(resources, cancellationToken, taskFactory).Forget();
+            AwaitableAccess(resources, taskFactory).Forget();
         }
 
         public static ExclusiveResourceTask AwaitableAccess(
             IEnumerable<ExclusiveResource> resources,
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask> taskFactory)
+            Func<ValueTask> taskFactory)
         {
             if (taskFactory == null)
                 throw new ArgumentException(nameof(taskFactory));
 
             return AwaitableAccess<object?>(
                 resources,
-                cancellationToken,
-                async cancellationToken =>
+                async () =>
                 {
-                    await taskFactory.Invoke(cancellationToken);
+                    await taskFactory.Invoke();
                     return null;
                 });
         }
 
         public static ExclusiveResourceTask<TResult> AwaitableAccess<TResult>(
             IEnumerable<ExclusiveResource> resources,
-            CancellationToken cancellationToken,
-            Func<CancellationToken, ValueTask<TResult>> taskFactory)
+            Func<ValueTask<TResult>> taskFactory)
         {
             if (taskFactory == null)
                 throw new ArgumentException(nameof(taskFactory));
@@ -126,9 +116,9 @@ namespace Lib
             }
 
             if (previousTask.IsCompleted)
-                InvokeAsync(taskFactory, task, cancellationToken);
+                InvokeAsync(taskFactory, task);
             else
-                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, task, cancellationToken));
+                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, task));
 
             return task;
         }
@@ -204,9 +194,8 @@ namespace Lib
         }
 
         private static async void InvokeAsync<TResult>(
-            Func<CancellationToken, ValueTask<TResult>> taskFactory,
-            ExclusiveResourceTask<TResult> task,
-            CancellationToken cancellationToken)
+            Func<ValueTask<TResult>> taskFactory,
+            ExclusiveResourceTask<TResult> task)
         {
             Exception? exception = null;
             TResult? result = default;
@@ -214,8 +203,7 @@ namespace Lib
             {
                 DeadlockDetector.BeginTask(task);
 
-                if (cancellationToken.IsCancellationRequested == false)
-                    result = await taskFactory.Invoke(cancellationToken);
+                result = await taskFactory.Invoke();
             }
             catch (Exception ex)
             {
