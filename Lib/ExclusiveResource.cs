@@ -1,27 +1,15 @@
-﻿using Microsoft.VisualBasic;
-using Microsoft.VisualStudio.TestPlatform;
-using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.Resources;
-using Newtonsoft.Json.Linq;
-using System;
-using System.Buffers;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.ComponentModel.DataAnnotations;
-using System.ComponentModel.Design;
 using System.Diagnostics;
-using System.Diagnostics.Contracts;
 using System.IO;
 using System.Linq;
-using System.Linq.Expressions;
-using System.Net.NetworkInformation;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace Dev
+namespace Lib
 {
     public sealed class ExclusiveResource
     {
@@ -34,7 +22,7 @@ namespace Dev
                 DebugLevel = debugLevel;
             else
 #if DEBUG
-                DebugLevel = 1;
+                DebugLevel = int.MaxValue;
 #else
                 DebugLevel = 0;
 #endif
@@ -42,7 +30,6 @@ namespace Dev
 
         private static int LastId;
         public int Id { get; } = Interlocked.Increment(ref LastId);
-
         public DebugInformation? DebugInfo { get; }
 
         private static readonly Task Locked = new(() => throw new InvalidOperationException());
@@ -307,10 +294,12 @@ namespace Dev
                     }
                 }
 
-                public static void End()
+                public static void End(ExclusiveResourceTask task)
                 {
                     var child = asyncLocal.Value;
-                    Debug.Assert(child != null && DebugLevel >= 1);
+                    Debug.Assert(child != null && task.DebugInfo != null);
+                    Debug.Assert(child == task.DebugInfo.Invoker);
+                    task.DebugInfo.Invoker = null;
 
                     var parent = child.Parent;
                     Debug.Assert(parent != null);
@@ -348,7 +337,7 @@ namespace Dev
                 if (task.DebugInfo == null)
                     return;
 
-                Invoker.End();
+                Invoker.End(task);
 
                 foreach (var resource in task.ResourceList)
                 {
@@ -391,9 +380,15 @@ namespace Dev
                             throw new DeadlockDetectedException(new[] { anyDeadlockResource });
                     }
 
-                    var deadlockList = TraversialRAG(task, new());
-                    if (deadlockList != null)
-                        throw new DeadlockDetectedException(deadlockList);
+                    while (true)
+                    {
+                        var deadlockList = TraversialRAG(task, new());
+                        if (deadlockList == null)
+                            break;
+
+                        if (HasResolvedState(deadlockList) == false)
+                            throw new DeadlockDetectedException(deadlockList);
+                    }
 
                     needRollback = false;
                     task.InternalTask.ContinueWith(_ =>
@@ -438,30 +433,66 @@ namespace Dev
                     return null;
                 }
 
-                static IEnumerable<(ExclusiveResource Resource, ExclusiveResourceTask AssignedTo)> GetNextNodes(ExclusiveResourceTask from)
+                static IEnumerable<(ExclusiveResource Resource, ExclusiveResourceTask AssignedTo)> GetNextNodes(ExclusiveResourceTask current)
                 {
-                    if (from.IsCompleted)
+                    if (current.IsCompleted)
                         yield break;
 
-                    foreach (var resource in from.ResourceList)
+                    foreach (var resource in current.ResourceList)
                     {
                         Debug.Assert(resource.DebugInfo != null);
                         var assignedTo = Volatile.Read(ref resource.DebugInfo.AssignedTo);
                         if (assignedTo == null)
-                            continue;
+                            continue; // 아무도 점유하지 않은 resource는 순환이 감지되지 않는다.
 
-                        if (assignedTo != from)
-                        {
-                            yield return (resource, assignedTo);
-                            continue;
-                        }
+                        if (assignedTo.IsCompleted)
+                            continue; // 점유하던 task가 종료되었으니 곧 점유가 해제될 예정이다.
 
-                        Debug.Assert(assignedTo.DebugInfo?.Invoker != null);
-                        foreach (var otherTask in assignedTo.DebugInfo.Invoker.AwaitingTasks.Values)
+                        if (assignedTo != current)
+                            yield return (resource, assignedTo); // 이 resource를 다른 task가 점유했다면 그것이 다음 node이다.
+                    }
+
+                    // 이 task가 현재 실행중이라면,
+                    // 그 invoker가 점유 시도하는 resource들을 살펴서
+                    // 교차 데드락 여부를 확인해야 한다.
+                    Debug.Assert(current.DebugInfo != null);
+                    var invoker = current.DebugInfo.Invoker;
+                    if (invoker != null)
+                    {
+                        foreach (var otherTask in invoker.AwaitingTasks.Values)
                             foreach (var e in GetNextNodes(otherTask))
                                 yield return e;
                     }
+                }
 
+                static bool HasResolvedState(IReadOnlyList<object> footprints)
+                {
+                    for (var i = 0; i < footprints.Count; i++)
+                    {
+                        switch (footprints[i])
+                        {
+                            case ExclusiveResource resource:
+                                Debug.Assert(resource.DebugInfo != null);
+                                var next = i + 1;
+                                if (next < footprints.Count)
+                                {
+                                    var expectedNext = resource.DebugInfo.AssignedTo;
+                                    var actualNext = footprints[next];
+                                    if (ReferenceEquals(expectedNext, actualNext) == false)
+                                        return true;
+                                }
+                                continue;
+
+                            case ExclusiveResourceTask task:
+                                if (task.IsCompleted)
+                                    return true;
+                                continue;
+                        }
+
+                        Debug.Fail($"unexpected type {footprints[i].GetType()}");
+                    }
+
+                    return false;
                 }
 
                 static bool AddFootprint(List<object> footprints, object node)
@@ -530,10 +561,15 @@ namespace Dev
             static async Task WrapForDeadlockDetector(ExclusiveResourceTask current) => await current;
         }
 
-        public async void Forget()
+        internal void Forget()
         {
             /// for <see cref="UnhandledExceptionEventHandler"/>
-            await this;
+            this.InternalTask.ContinueWith(task =>
+            {
+                if (task.Exception != null)
+                    ThreadPool.UnsafeQueueUserWorkItem(_ => task.GetAwaiter().GetResult(), null);
+            });
+
         }
 
         public readonly struct Awaiter : INotifyCompletion, ICriticalNotifyCompletion
