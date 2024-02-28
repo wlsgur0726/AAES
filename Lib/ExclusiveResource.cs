@@ -84,9 +84,9 @@ namespace Lib
                 });
         }
 
-        public static ExclusiveResourceTask<TResult> AwaitableAccess<TResult>(
+        public static ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(
             IEnumerable<ExclusiveResource> resources,
-            Func<ValueTask<TResult>> taskFactory)
+            Func<ValueTask<TResult?>> taskFactory)
         {
             if (taskFactory == null)
                 throw new ArgumentException(nameof(taskFactory));
@@ -97,7 +97,7 @@ namespace Lib
             var resourceList = resources
                 .Where(e => e != null)
                 .Distinct()
-                /// for <see cref="ExchangeLastTask"/>
+                /// for <see cref="Locked"/>
                 .OrderBy(e => e.Id)
                 .ThenBy(e => e.GetHashCode())
                 .ToList();
@@ -106,7 +106,7 @@ namespace Lib
             ExchangeLastTask(resourceList, tcs.Task, out var previousTask);
 
             var invoker = DeadlockDetector.Invoker.Current;
-            var task = new ExclusiveResourceTask<TResult>(tcs, resourceList, previousTask, invoker);
+            var task = new ExclusiveResourceTask<TResult?>(tcs, resourceList, previousTask, invoker);
 
             if (DebugLevel >= 2)
             {
@@ -123,6 +123,20 @@ namespace Lib
             return task;
         }
 
+        /// <summary>
+        /// 모든 resource들의 <see cref="lastTask"/>를 원자적으로 교체한다.
+        /// 원자적이게 하지 않으면 아래 예시처럼 데드락 발생 가능.
+        /// <code>
+        /// ex) t1, t2가 동시에 r1, r2를 점유 시도
+        ///     event\state         r1.lastTask     r2.lastTask     t1.previousTask     t2.previousTask
+        ///     ----------------------------------------------------------------------------------------
+        ///     example state       t0              t0              unknown             unknown
+        ///     exchange r1 (t1)    t1              t0              t0                  unknown
+        ///     exchange r1 (t2)    t2              t0              t0                  t1
+        ///     exchange r2 (t2)    t2              t2              t0                  t1, t0
+        ///     exchange r2 (t1)    t2              t1              t0, t2              t1, t0
+        /// </code>
+        /// </summary>
         private static void ExchangeLastTask(
             IReadOnlyList<ExclusiveResource> resourceList,
             Task currentTask,
@@ -151,6 +165,7 @@ namespace Lib
             var exchangeds = new Task?[resourceList.Count];
 
             RETRY:
+            // get snapshot for locking
             for (var i = 0; i < resourceList.Count; ++i)
             {
                 snapshots[i] = Volatile.Read(ref resourceList[i].lastTask);
@@ -194,8 +209,8 @@ namespace Lib
         }
 
         private static async void InvokeAsync<TResult>(
-            Func<ValueTask<TResult>> taskFactory,
-            ExclusiveResourceTask<TResult> task)
+            Func<ValueTask<TResult?>> taskFactory,
+            ExclusiveResourceTask<TResult?> task)
         {
             Exception? exception = null;
             TResult? result = default;
@@ -549,15 +564,10 @@ namespace Lib
             static async Task WrapForDeadlockDetector(ExclusiveResourceTask current) => await current;
         }
 
-        internal void Forget()
+        internal async void Forget()
         {
             /// for <see cref="UnhandledExceptionEventHandler"/>
-            this.InternalTask.ContinueWith(task =>
-            {
-                if (task.Exception != null)
-                    ThreadPool.UnsafeQueueUserWorkItem(_ => task.GetAwaiter().GetResult(), null);
-            });
-
+            await this.InternalTask;
         }
 
         public readonly struct Awaiter : INotifyCompletion, ICriticalNotifyCompletion
@@ -615,7 +625,7 @@ namespace Lib
                 ? WrapForDeadlockDetector(this)
                 : this.tcs.Task;
 
-            static async Task<TResult?> WrapForDeadlockDetector(ExclusiveResourceTask<TResult> current) => await current;
+            static async Task<TResult?> WrapForDeadlockDetector(ExclusiveResourceTask<TResult?> current) => await current;
         }
 
         new public ResultAwaiter GetAwaiter()
@@ -627,7 +637,7 @@ namespace Lib
         {
             private readonly Task<TResult?> internalTask;
 
-            internal ResultAwaiter(ExclusiveResourceTask<TResult> task)
+            internal ResultAwaiter(ExclusiveResourceTask<TResult?> task)
             {
                 this.internalTask = task.tcs.Task;
                 if (task.DebugInfo != null)
