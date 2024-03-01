@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Lib
@@ -11,12 +12,16 @@ namespace Lib
         internal ExclusiveResourceTask(
             Task internalTask,
             IReadOnlyList<ExclusiveResource> resourceList,
+            TimeSpan? waitingTimeout,
             Task previousTask,
             ExclusiveResource.DeadlockDetector.Invoker? parent)
         {
             this.InternalTask = internalTask;
             this.ResourceList = resourceList;
             this.DebugInfo = parent == null ? null : new(parent, previousTask);
+            this.waitingTimeoutTimer = waitingTimeout.HasValue && waitingTimeout.Value > TimeSpan.Zero
+                ? new(this, waitingTimeout.Value)
+                : null;
             Debug.Assert((parent != null) == (ExclusiveResource.DebugLevel >= 1));
         }
 
@@ -31,6 +36,9 @@ namespace Lib
         internal Task InternalTask { get; }
         internal DebugInformation? DebugInfo { get; }
 
+        protected Task? WaitingTimeoutTask => waitingTimeoutTimer?.TimerTask;
+        private readonly WaitingTimeoutTimer? waitingTimeoutTimer;
+
         public override string ToString()
             => $"{nameof(ExclusiveResourceTask)}({this.Id})";
 
@@ -39,14 +47,8 @@ namespace Lib
             return new(this);
         }
 
-        public Task AsTask()
-        {
-            return this.DebugInfo != null
-                ? WrapForDeadlockDetector(this)
-                : this.InternalTask;
-
-            static async Task WrapForDeadlockDetector(ExclusiveResourceTask current) => await current;
-        }
+        public Task AsTask() => this.AsTaskInternal();
+        protected abstract Task AsTaskInternal();
 
         internal async void Forget()
         {
@@ -54,13 +56,24 @@ namespace Lib
             await this.InternalTask;
         }
 
+        internal void ThrowIfWaitingTimeout()
+        {
+            if (this.waitingTimeoutTimer == null)
+                return;
+
+            if (this.waitingTimeoutTimer.TryCancel() == false)
+                this.waitingTimeoutTimer.TimerTask.GetAwaiter().GetResult();
+        }
+
+        protected abstract Task GetInternalTaskForAwaiter();
+
         public readonly struct Awaiter : INotifyCompletion, ICriticalNotifyCompletion
         {
             private readonly Task internalTask;
 
             internal Awaiter(ExclusiveResourceTask task)
             {
-                this.internalTask = task.InternalTask;
+                this.internalTask = task.GetInternalTaskForAwaiter();
                 if (task.DebugInfo != null)
                     ExclusiveResource.DeadlockDetector.CheckDeadlock(task);
             }
@@ -85,6 +98,59 @@ namespace Lib
                 this.PreviousTask = previousTask;
             }
         }
+
+        private sealed class WaitingTimeoutTimer
+        {
+            private readonly CancellationTokenSource cts = new();
+            private readonly ExclusiveResourceTask task;
+            private readonly TimeSpan timeout;
+            private int result;
+
+            public WaitingTimeoutTimer(ExclusiveResourceTask task, TimeSpan timeout)
+            {
+                this.task = task;
+                this.timeout = timeout;
+                this.TimerTask = this.Start();
+            }
+
+            public Task TimerTask { get; }
+
+            public bool TryCancel()
+            {
+                if (0 != Interlocked.CompareExchange(ref this.result, 1, 0))
+                    return false;
+
+                try
+                {
+                    this.cts.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+
+                return true;
+            }
+
+            private async Task Start()
+            {
+                try
+                {
+                    await Task.Delay(this.timeout, this.cts.Token);
+
+                    if (0 == Interlocked.CompareExchange(ref this.result, 2, 0))
+                        throw new ExclusiveResource.WaitingTimeoutException(this.task.DebugInfo?.PreviousTask);
+                }
+                catch (OperationCanceledException e) when (e.CancellationToken == this.cts.Token)
+                {
+                    Debug.Assert(this.result == 1);
+                }
+                finally
+                {
+                    Debug.Assert(this.result != 0);
+                    this.cts.Dispose();
+                }
+            }
+        }
     }
 
     public sealed class ExclusiveResourceTask<TResult> : ExclusiveResourceTask
@@ -94,27 +160,47 @@ namespace Lib
         internal ExclusiveResourceTask(
             TaskCompletionSource<TResult?> tcs,
             IReadOnlyList<ExclusiveResource> resourceList,
+            TimeSpan? waitingTimeout,
             Task previousTask,
             ExclusiveResource.DeadlockDetector.Invoker? parent)
-            : base(tcs.Task, resourceList, previousTask, parent)
+            : base(tcs.Task, resourceList, waitingTimeout, previousTask, parent)
         {
             this.tcs = tcs;
         }
 
         internal TaskCompletionSource<TResult?> Tcs => this.tcs;
 
+        new public ResultAwaiter GetAwaiter()
+        {
+            return new(this);
+        }
+
+        protected override Task AsTaskInternal() => this.AsTask();
         new public Task<TResult?> AsTask()
         {
             return this.DebugInfo != null
                 ? WrapForDeadlockDetector(this)
-                : this.tcs.Task;
+                : this.GetInternalTaskForResultAwaiter();
 
             static async Task<TResult?> WrapForDeadlockDetector(ExclusiveResourceTask<TResult?> current) => await current;
         }
 
-        new public ResultAwaiter GetAwaiter()
+        protected override Task GetInternalTaskForAwaiter() => this.GetInternalTaskForResultAwaiter();
+        private Task<TResult?> GetInternalTaskForResultAwaiter()
         {
-            return new(this);
+            Debug.Assert(this.tcs.Task == this.InternalTask);
+
+            var waitingTimeoutTask = this.WaitingTimeoutTask;
+            return waitingTimeoutTask == null
+                ? this.tcs.Task
+                : Combine(this.tcs.Task, waitingTimeoutTask);
+
+            static async Task<TResult?> Combine(Task<TResult?> internalTask, Task waitingTimeoutTask)
+            {
+                await Task.WhenAny(internalTask, waitingTimeoutTask);
+                waitingTimeoutTask.GetAwaiter().GetResult(); // throw if timeout
+                return internalTask.Result;
+            }
         }
 
         public readonly struct ResultAwaiter : INotifyCompletion, ICriticalNotifyCompletion
@@ -123,7 +209,7 @@ namespace Lib
 
             internal ResultAwaiter(ExclusiveResourceTask<TResult?> task)
             {
-                this.internalTask = task.tcs.Task;
+                this.internalTask = task.GetInternalTaskForResultAwaiter();
                 if (task.DebugInfo != null)
                     ExclusiveResource.DeadlockDetector.CheckDeadlock(task);
             }
@@ -133,5 +219,6 @@ namespace Lib
             public void UnsafeOnCompleted(Action continuation) => this.internalTask.GetAwaiter().UnsafeOnCompleted(continuation);
             public TResult? GetResult() => this.internalTask.GetAwaiter().GetResult();
         }
+
     }
 }

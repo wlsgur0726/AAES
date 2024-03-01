@@ -146,5 +146,40 @@ namespace Lib.Test
                     Console.WriteLine("do somthing");
                 });
         }
+
+        [Fact]
+        public static async Task WaitingTimeout()
+        {
+            var resource = new ExclusiveResource();
+
+            var t1 = resource.Access.ThenAsync(async _ =>
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(100));
+            });
+
+            var t2 = resource.Access
+                .WithWaitingTimeout(TimeSpan.FromMilliseconds(1))
+                .ThenAsync(_ =>
+                {
+                    Assert.Fail($"not called due to {nameof(ExclusiveResource.AccessTrigger.WithWaitingTimeout)}");
+                    return default;
+                });
+            await Assert.ThrowsAsync<ExclusiveResource.WaitingTimeoutException>(async () => await t2);
+
+            Assert.False(t1.IsCompleted);
+
+            // t2의 실패가 확정적이지만 완료는 t1의 완료까지 미뤄진다.
+            // t1이 완료되지 않았는데 t3가 시작되는 버그를 막기 위한 정책.
+            Assert.False(t2.IsCompleted);
+
+            var t3 = resource.Access.ThenAsync(_ =>
+            {
+                Assert.True(t1.IsCompleted);
+                Assert.True(t2.IsCompleted);
+                Assert.True(t2.Exception?.InnerException is ExclusiveResource.WaitingTimeoutException);
+                return default;
+            });
+            await t3;
+        }
     }
 }

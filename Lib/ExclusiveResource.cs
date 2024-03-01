@@ -76,7 +76,12 @@ namespace Lib
             ExchangeLastTask(resourceList, tcs.Task, out var previousTask);
 
             var invoker = DeadlockDetector.Invoker.Current;
-            var task = new ExclusiveResourceTask<TResult?>(tcs, resourceList, previousTask, invoker);
+            var task = new ExclusiveResourceTask<TResult?>(
+                tcs,
+                resourceList,
+                waitingTimeout,
+                previousTask,
+                invoker);
 
             if (DebugLevel >= 2)
             {
@@ -86,16 +91,9 @@ namespace Lib
             }
 
             if (previousTask.IsCompleted)
-            {
-                InvokeAsync(taskFactory, null, cancellationOption, task);
-            }
+                InvokeAsync(taskFactory, cancellationOption, task);
             else
-            {
-                var waitingTimeoutTimer = waitingTimeout.HasValue
-                    ? new WaitingTimeoutTimer<TResult>(task, waitingTimeout.Value)
-                    : null;
-                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, waitingTimeoutTimer, cancellationOption, task));
-            }
+                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, cancellationOption, task));
 
             return task;
         }
@@ -187,22 +185,16 @@ namespace Lib
 
         private static async void InvokeAsync<TResult>(
             Func<CancellationToken, ValueTask<TResult?>> taskFactory,
-            WaitingTimeoutTimer<TResult>? waitingTimeoutTimer,
             CancellationOption cancellationOption,
             ExclusiveResourceTask<TResult?> task)
         {
-            bool isWaitingTimeout = false;
             TResult? result = default;
             Exception? exception = null;
             try
             {
                 DeadlockDetector.BeginTask(task);
 
-                if (waitingTimeoutTimer != null && waitingTimeoutTimer.TryCancel() == false)
-                {
-                    isWaitingTimeout = true;
-                    return;
-                }
+                task.ThrowIfWaitingTimeout();
 
                 if (cancellationOption.Token.IsCancellationRequested)
                 {
@@ -228,10 +220,10 @@ namespace Lib
                     Debug.Assert(exchanged != null);
                 }
 
-                if (exception != null)
-                    task.Tcs.TrySetException(exception);
-                else if (isWaitingTimeout == false)
+                if (exception == null)
                     task.Tcs.TrySetResult(result);
+                else
+                    task.Tcs.TrySetException(exception);
             }
         }
 
@@ -291,53 +283,6 @@ namespace Lib
         {
             public CancellationToken Token { get; init; }
             public bool SuppressException { get; init; } 
-        }
-
-        private sealed class WaitingTimeoutTimer<TResult>
-        {
-            private readonly CancellationTokenSource cts = new();
-            private int result;
-
-            public WaitingTimeoutTimer(ExclusiveResourceTask<TResult?> task, TimeSpan timeout)
-            {
-                this.Start(task, timeout);
-            }
-
-            public bool TryCancel()
-            {
-                if (0 != Interlocked.CompareExchange(ref this.result, 1, 0))
-                    return false;
-
-                try
-                {
-                    this.cts.Cancel();
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-
-                return true;
-            }
-
-            private async void Start(ExclusiveResourceTask<TResult?> task, TimeSpan timeout)
-            {
-                try
-                {
-                    await Task.Delay(timeout, this.cts.Token);
-
-                    if (0 == Interlocked.CompareExchange(ref this.result, 2, 0))
-                        task.Tcs.TrySetException(new WaitingTimeoutException(task.DebugInfo?.PreviousTask));
-                }
-                catch (OperationCanceledException e) when (e.CancellationToken == this.cts.Token)
-                {
-                    Debug.Assert(this.result == 1);
-                }
-                finally
-                {
-                    Debug.Assert(this.result != 0);
-                    this.cts.Dispose();
-                }
-            }
         }
 
         public sealed class DebugInformation
