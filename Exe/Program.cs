@@ -1,11 +1,11 @@
-﻿using Lib.Test;
+﻿using AAES.Test;
 using System;
 using System.Threading.Tasks;
 
 try
 {
     Console.WriteLine("start");
-    await Tests.UnhandledException();
+    await AdvancedTests.UnhandledExceptionAppDomain();
 }
 finally
 {

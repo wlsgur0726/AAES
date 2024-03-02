@@ -1,18 +1,20 @@
-﻿using System;
+﻿using AAES;
+using AAES.Exceptions;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
 
-namespace Lib.Test
+namespace AAES.Test
 {
-    public static class Usages
+    public static class Features
     {
         [Fact]
         public static void LikeActorModel()
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
             resource.Access.Then(async () =>
             {
                 await Task.Yield();
@@ -23,7 +25,7 @@ namespace Lib.Test
         [Fact]
         public static async Task AwaitableAccess()
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
             var result = await resource.Access.ThenAsync(async () =>
             {
                 await Task.Delay(100);
@@ -35,7 +37,7 @@ namespace Lib.Test
         [Fact]
         public static async Task AsynchronousAccess()
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
 
             var tcs = new TaskCompletionSource<object?>();
             resource.Access.Then(async () =>
@@ -76,12 +78,10 @@ namespace Lib.Test
         [InlineData(10000)]
         public static async Task GuaranteedSequentialAccess(int maxNumber)
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
 
             var actualList = new List<int>();
-            var expectedList = Enumerable
-                .Range(1, maxNumber)
-                .ToList();
+            var expectedList = Enumerable.Range(1, maxNumber).ToList();
 
             foreach (var number in expectedList)
             {
@@ -104,7 +104,7 @@ namespace Lib.Test
         public static async Task GuaranteedExclusiveAccess(int threadCount, int accessCount)
         {
             var number = 0;
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
 
             var threads = new List<Thread>();
             for (var i = 0; i < threadCount; i++)
@@ -134,11 +134,11 @@ namespace Lib.Test
         [Fact]
         public static void MultipleResourceAccess()
         {
-            var resource1 = new ExclusiveResource();
-            var resource2 = new ExclusiveResource();
-            var resource3 = new ExclusiveResource();
+            var resource1 = new AAESResource();
+            var resource2 = new AAESResource();
+            var resource3 = new AAESResource();
 
-            ExclusiveResource
+            AAESResource
                 .AccessTo(new[] { resource1, resource2, resource3 })
                 .Then(async () =>
                 {
@@ -150,7 +150,7 @@ namespace Lib.Test
         [Fact]
         public static async Task WithWaitingTimeout()
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
 
             var t1 = resource.Access.ThenAsync(async () =>
             {
@@ -162,10 +162,10 @@ namespace Lib.Test
                 .WithWaitingTimeout(TimeSpan.FromMilliseconds(1))
                 .ThenAsync(() =>
                 {
-                    Assert.Fail($"not called due to {nameof(ExclusiveResource.AccessTrigger.WithWaitingTimeout)}");
+                    Assert.Fail($"not called due to '{nameof(AAESTaskBuilder.WithWaitingTimeout)}'");
                     return default;
                 });
-            await Assert.ThrowsAsync<ExclusiveResource.WaitingTimeoutException>(async () => await t2);
+            await Assert.ThrowsAsync<WaitingTimeoutException>(async () => await t2);
 
             Assert.False(t1.IsCompleted);
 
@@ -179,7 +179,7 @@ namespace Lib.Test
                 Assert.True(t2.IsCompleted);
                 Assert.True(t2.IsFaulted);
                 Assert.True(t2.IsCanceled);
-                Assert.True(t2.Exception?.InnerException is ExclusiveResource.WaitingTimeoutException);
+                Assert.True(t2.Exception?.InnerException is WaitingTimeoutException);
                 return default;
             });
             await t3;
@@ -188,7 +188,7 @@ namespace Lib.Test
         [Fact]
         public static async Task WithCancellationToken()
         {
-            var resource = new ExclusiveResource();
+            var resource = new AAESResource();
 
             var t1 = resource.Access.ThenAsync(async () =>
             {
@@ -203,10 +203,10 @@ namespace Lib.Test
                 .WithCancellationToken(cts.Token)
                 .ThenAsync(() =>
                 {
-                    Assert.Fail($"not called due to {nameof(ExclusiveResource.AccessTrigger.WithCancellationToken)}");
+                    Assert.Fail($"not called due to '{nameof(AAESTaskBuilder.WithCancellationToken)}'");
                     return default;
                 });
-            await Assert.ThrowsAsync<ExclusiveResource.WaitingCanceledException>(async () => await t2);
+            await Assert.ThrowsAsync<WaitingCanceledException>(async () => await t2);
 
             Assert.False(t1.IsCompleted);
 
@@ -220,7 +220,7 @@ namespace Lib.Test
                 Assert.True(t2.IsCompleted);
                 Assert.True(t2.IsFaulted);
                 Assert.True(t2.IsCanceled);
-                Assert.True(t2.Exception?.InnerException is ExclusiveResource.WaitingCanceledException);
+                Assert.True(t2.Exception?.InnerException is WaitingCanceledException);
                 return default;
             });
             await t3;

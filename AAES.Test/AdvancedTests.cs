@@ -1,12 +1,14 @@
-﻿using System;
+﻿using AAES;
+using AAES.Exceptions;
+using System;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
 
-namespace Lib.Test
+namespace AAES.Test
 {
-    public static class Tests
+    public static class AdvancedTests
     {
         [Theory]
         [InlineData(3, 5, 100)]
@@ -17,7 +19,7 @@ namespace Lib.Test
 
             var resources = Enumerable
                 .Range(0, resourceCount)
-                .Select(_ => new ExclusiveResource())
+                .Select(_ => new AAESResource())
                 .ToList();
 
             var startedAt = DateTime.UtcNow;
@@ -27,7 +29,7 @@ namespace Lib.Test
                 {
                     var random = new Random();
                     var shuffledResources = resources.ToList();
-                    ExclusiveResourceTask lastTask;
+                    AAESTask lastTask;
                     do
                     {
                         for (var i = 0; i < shuffledResources.Count; i++)
@@ -38,7 +40,7 @@ namespace Lib.Test
                             shuffledResources[swapIdx] = temp;
                         }
 
-                        lastTask = ExclusiveResource
+                        lastTask = AAESResource
                             .AccessTo(shuffledResources)
                             .ThenAsync(() => default);
 
@@ -53,11 +55,11 @@ namespace Lib.Test
         public static async Task SelfDeadlock()
         {
             var resources = new[] {
-                new ExclusiveResource(),
-                new ExclusiveResource(),
+                new AAESResource(),
+                new AAESResource(),
             };
 
-            var task = ExclusiveResource.AccessTo(resources).ThenAsync(async () =>
+            var task = AAESResource.AccessTo(resources).ThenAsync(async () =>
             {
                 Console.WriteLine("111");
                 var innerTask = resources[1].Access.ThenAsync(async () =>
@@ -66,8 +68,8 @@ namespace Lib.Test
                     Console.WriteLine("222");
                 });
                 await Assert.ThrowsAsync(
-                    ExclusiveResource.DebugLevel >= 1
-                        ? typeof(ExclusiveResource.DeadlockDetectedException)
+                    AAESDebug.DebugLevel >= 1
+                        ? typeof(DeadlockDetectedException)
                         : typeof(TimeoutException),
                     () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500)));
                 Console.WriteLine("333");
@@ -80,8 +82,8 @@ namespace Lib.Test
         public static async Task CrossDeadlock()
         {
             var resources = new[] {
-                new ExclusiveResource(),
-                new ExclusiveResource(),
+                new AAESResource(),
+                new AAESResource(),
             };
 
             for (var i = 0; i < 5; ++i)
@@ -134,8 +136,8 @@ namespace Lib.Test
                         return default;
                     });
                     await Assert.ThrowsAsync(
-                        ExclusiveResource.DebugLevel >= 1
-                            ? typeof(ExclusiveResource.DeadlockDetectedException)
+                        AAESDebug.DebugLevel >= 1
+                            ? typeof(DeadlockDetectedException)
                             : typeof(TimeoutException),
                         () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(100)));
 
@@ -152,8 +154,8 @@ namespace Lib.Test
         public static async Task Join()
         {
             var resources = new[] {
-                new ExclusiveResource(),
-                new ExclusiveResource(),
+                new AAESResource(),
+                new AAESResource(),
             };
 
             var t01 = resources[0].Access.ThenAsync(async () =>
@@ -191,12 +193,41 @@ namespace Lib.Test
                 t12.AsTask());
         }
 
-        #pragma warning disable xUnit1013 
-        //[Fact]
-        public static async Task UnhandledException()
-        #pragma warning restore xUnit1013 
+        [Fact]
+        public static async Task UnhandledExceptionHandelr()
         {
-            var expectedMessage = $"test {nameof(UnhandledException)} for Forget method. {DateTime.UtcNow.Ticks}";
+            var expectedMessage = $"test {nameof(UnhandledExceptionHandelr)} for Forget method. {DateTime.UtcNow.Ticks}";
+            var tcs = new TaskCompletionSource<string?>();
+            var handler = new Func<Exception, bool>(e =>
+            {
+                var exception = e as InvalidOperationException;
+                tcs.TrySetResult(exception?.Message);
+                return true;
+            });
+
+            try
+            {
+                AAESDebug.UnhandledExceptionHandler += handler;
+                ThreadPool.UnsafeQueueUserWorkItem(_ =>
+                {
+                    new AAESResource().Access.Then(() => throw new InvalidOperationException(expectedMessage));
+                }, null);
+
+                var message = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+                Assert.Equal(expectedMessage, message);
+            }
+            finally
+            {
+                AAESDebug.UnhandledExceptionHandler -= handler;
+            }
+        }
+
+#pragma warning disable xUnit1013
+        //[Fact]
+        public static async Task UnhandledExceptionAppDomain()
+#pragma warning restore xUnit1013 
+        {
+            var expectedMessage = $"test {nameof(UnhandledExceptionAppDomain)} for Forget method. {DateTime.UtcNow.Ticks}";
             var tcs = new TaskCompletionSource<string?>();
             var handler = new UnhandledExceptionEventHandler((sender, e) =>
             {
@@ -209,7 +240,7 @@ namespace Lib.Test
                 AppDomain.CurrentDomain.UnhandledException += handler;
                 ThreadPool.UnsafeQueueUserWorkItem(_ =>
                 {
-                    new ExclusiveResource().Access.Then(() => throw new InvalidOperationException(expectedMessage));
+                    new AAESResource().Access.Then(() => throw new InvalidOperationException(expectedMessage));
                 }, null);
 
                 var message = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
