@@ -12,16 +12,14 @@ namespace Lib
         internal ExclusiveResourceTask(
             Task internalTask,
             IReadOnlyList<ExclusiveResource> resourceList,
-            TimeSpan? waitingTimeout,
+            ExclusiveResource.WaitingCancellationOptions? waitingCancellationOptions,
             Task previousTask,
             ExclusiveResource.DeadlockDetector.Invoker? parent)
         {
             this.InternalTask = internalTask;
             this.ResourceList = resourceList;
+            this.WaitingCancellationOptions = waitingCancellationOptions;
             this.DebugInfo = parent == null ? null : new(parent, previousTask);
-            this.waitingTimeoutTimer = waitingTimeout.HasValue && waitingTimeout.Value > TimeSpan.Zero
-                ? new(this, waitingTimeout.Value)
-                : null;
             Debug.Assert((parent != null) == (ExclusiveResource.DebugLevel >= 1));
         }
 
@@ -29,15 +27,13 @@ namespace Lib
         public AggregateException? Exception => this.InternalTask.Exception;
         public bool IsFaulted => this.InternalTask.IsFaulted;
         public bool IsCompleted => this.InternalTask.IsCompleted;
-        public bool IsCanceled => this.InternalTask.IsCanceled;
+        public bool IsCanceled => this.InternalTask.IsCanceled || (this.Exception?.InnerException is ExclusiveResource.ICanceledException);
         public bool IsCompletedSuccessfully => this.InternalTask.IsCompletedSuccessfully;
         public IReadOnlyList<ExclusiveResource> ResourceList { get; }
 
         internal Task InternalTask { get; }
+        internal ExclusiveResource.WaitingCancellationOptions? WaitingCancellationOptions { get; }
         internal DebugInformation? DebugInfo { get; }
-
-        protected Task? WaitingTimeoutTask => waitingTimeoutTimer?.TimerTask;
-        private readonly WaitingTimeoutTimer? waitingTimeoutTimer;
 
         public override string ToString()
             => $"{nameof(ExclusiveResourceTask)}({this.Id})";
@@ -54,15 +50,6 @@ namespace Lib
         {
             /// for <see cref="UnhandledExceptionEventHandler"/>
             await this.InternalTask;
-        }
-
-        internal void ThrowIfWaitingTimeout()
-        {
-            if (this.waitingTimeoutTimer == null)
-                return;
-
-            if (this.waitingTimeoutTimer.TryCancel() == false)
-                this.waitingTimeoutTimer.TimerTask.GetAwaiter().GetResult();
         }
 
         protected abstract Task GetInternalTaskForAwaiter();
@@ -98,59 +85,6 @@ namespace Lib
                 this.PreviousTask = previousTask;
             }
         }
-
-        private sealed class WaitingTimeoutTimer
-        {
-            private readonly CancellationTokenSource cts = new();
-            private readonly ExclusiveResourceTask task;
-            private readonly TimeSpan timeout;
-            private int result;
-
-            public WaitingTimeoutTimer(ExclusiveResourceTask task, TimeSpan timeout)
-            {
-                this.task = task;
-                this.timeout = timeout;
-                this.TimerTask = this.Start();
-            }
-
-            public Task TimerTask { get; }
-
-            public bool TryCancel()
-            {
-                if (0 != Interlocked.CompareExchange(ref this.result, 1, 0))
-                    return false;
-
-                try
-                {
-                    this.cts.Cancel();
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-
-                return true;
-            }
-
-            private async Task Start()
-            {
-                try
-                {
-                    await Task.Delay(this.timeout, this.cts.Token);
-
-                    if (0 == Interlocked.CompareExchange(ref this.result, 2, 0))
-                        throw new ExclusiveResource.WaitingTimeoutException(this.task.DebugInfo?.PreviousTask);
-                }
-                catch (OperationCanceledException e) when (e.CancellationToken == this.cts.Token)
-                {
-                    Debug.Assert(this.result == 1);
-                }
-                finally
-                {
-                    Debug.Assert(this.result != 0);
-                    this.cts.Dispose();
-                }
-            }
-        }
     }
 
     public sealed class ExclusiveResourceTask<TResult> : ExclusiveResourceTask
@@ -160,10 +94,10 @@ namespace Lib
         internal ExclusiveResourceTask(
             TaskCompletionSource<TResult?> tcs,
             IReadOnlyList<ExclusiveResource> resourceList,
-            TimeSpan? waitingTimeout,
+            ExclusiveResource.WaitingCancellationOptions? waitingCancellationOptions,
             Task previousTask,
             ExclusiveResource.DeadlockDetector.Invoker? parent)
-            : base(tcs.Task, resourceList, waitingTimeout, previousTask, parent)
+            : base(tcs.Task, resourceList, waitingCancellationOptions, previousTask, parent)
         {
             this.tcs = tcs;
         }
@@ -190,15 +124,14 @@ namespace Lib
         {
             Debug.Assert(this.tcs.Task == this.InternalTask);
 
-            var waitingTimeoutTask = this.WaitingTimeoutTask;
-            return waitingTimeoutTask == null
+            return this.WaitingCancellationOptions == null
                 ? this.tcs.Task
-                : Combine(this.tcs.Task, waitingTimeoutTask);
+                : Combine(this.tcs.Task, this.WaitingCancellationOptions.Task);
 
-            static async Task<TResult?> Combine(Task<TResult?> internalTask, Task waitingTimeoutTask)
+            static async Task<TResult?> Combine(Task<TResult?> internalTask, Task waitingCancellationTask)
             {
-                await Task.WhenAny(internalTask, waitingTimeoutTask);
-                waitingTimeoutTask.GetAwaiter().GetResult(); // throw if timeout
+                await Task.WhenAny(internalTask, waitingCancellationTask);
+                waitingCancellationTask.GetAwaiter().GetResult(); // throw if cancelled
                 return internalTask.Result;
             }
         }

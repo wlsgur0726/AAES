@@ -54,9 +54,9 @@ namespace Lib
 
         public static ExclusiveResourceTask<TResult?> AwaitableAccess<TResult>(
             IEnumerable<ExclusiveResource> resources,
-            CancellationOption cancellationOption,
+            CancellationToken cancellationToken,
             TimeSpan? waitingTimeout,
-            Func<CancellationToken, ValueTask<TResult?>> taskFactory)
+            Func<ValueTask<TResult?>> taskFactory)
         {
             if (taskFactory == null)
                 throw new ArgumentNullException(nameof(taskFactory));
@@ -79,7 +79,10 @@ namespace Lib
             var task = new ExclusiveResourceTask<TResult?>(
                 tcs,
                 resourceList,
-                waitingTimeout,
+                WaitingCancellationOptions.CreateIfNeed(
+                    previousTask,
+                    waitingTimeout,
+                    cancellationToken),
                 previousTask,
                 invoker);
 
@@ -91,9 +94,9 @@ namespace Lib
             }
 
             if (previousTask.IsCompleted)
-                InvokeAsync(taskFactory, cancellationOption, task);
+                InvokeAsync(taskFactory, task);
             else
-                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, cancellationOption, task));
+                previousTask.ContinueWith(_ => InvokeAsync(taskFactory, task));
 
             return task;
         }
@@ -184,8 +187,7 @@ namespace Lib
         }
 
         private static async void InvokeAsync<TResult>(
-            Func<CancellationToken, ValueTask<TResult?>> taskFactory,
-            CancellationOption cancellationOption,
+            Func<ValueTask<TResult?>> taskFactory,
             ExclusiveResourceTask<TResult?> task)
         {
             TResult? result = default;
@@ -194,17 +196,8 @@ namespace Lib
             {
                 DeadlockDetector.BeginTask(task);
 
-                task.ThrowIfWaitingTimeout();
-
-                if (cancellationOption.Token.IsCancellationRequested)
-                {
-                    if (cancellationOption.SuppressException)
-                        return;
-                    else
-                        throw new OperationCanceledException(cancellationOption.Token);
-                }
-
-                result = await taskFactory.Invoke(cancellationOption.Token);
+                task.WaitingCancellationOptions?.ThrowIfCanceled();
+                result = await taskFactory.Invoke();
             }
             catch (Exception ex)
             {
@@ -214,11 +207,7 @@ namespace Lib
             {
                 DeadlockDetector.EndTask(task);
 
-                foreach (var resource in task.ResourceList)
-                {
-                    var exchanged = Interlocked.CompareExchange(ref resource.lastTask, null, task.InternalTask);
-                    Debug.Assert(exchanged != null);
-                }
+                UnlinkLastTask(task.ResourceList, task.InternalTask);
 
                 if (exception == null)
                     task.Tcs.TrySetResult(result);
@@ -227,22 +216,31 @@ namespace Lib
             }
         }
 
+        private static void UnlinkLastTask(IReadOnlyList<ExclusiveResource> resourceList, Task finishedTask)
+        {
+            foreach (var resource in resourceList)
+            {
+                var exchanged = Interlocked.CompareExchange(ref resource.lastTask, null, finishedTask);
+                Debug.Assert(exchanged != null);
+            }
+        }
+
         public ref struct AccessTrigger
         {
             private IEnumerable<ExclusiveResource> resources;
-            private CancellationOption cancellationOption;
+            private CancellationToken cancellationToken;
             private TimeSpan? waitingTimeout;
 
             internal AccessTrigger(IEnumerable<ExclusiveResource> resources)
             {
                 this.resources = resources;
-                this.cancellationOption = default;
+                this.cancellationToken = default;
                 this.waitingTimeout = null;
             }
 
-            public AccessTrigger WithCancellationOption(CancellationOption option)
+            public AccessTrigger WithCancellationToken(CancellationToken token)
             {
-                this.cancellationOption = option;
+                this.cancellationToken = token;
                 return this;
             }
 
@@ -252,37 +250,90 @@ namespace Lib
                 return this;
             }
 
-            public void Then(Func<CancellationToken, ValueTask> taskFactory)
+            public void Then(Func<ValueTask> taskFactory)
             {
                 this.ThenAsync(taskFactory).Forget();
             }
 
-            public ExclusiveResourceTask ThenAsync(Func<CancellationToken, ValueTask> taskFactory)
+            public ExclusiveResourceTask ThenAsync(Func<ValueTask> taskFactory)
             {
                 if (taskFactory == null)
                     throw new ArgumentNullException(nameof(taskFactory));
 
-                return this.ThenAsync<object>(async ct =>
+                return this.ThenAsync<object>(async () =>
                 {
-                    await taskFactory.Invoke(ct);
+                    await taskFactory.Invoke();
                     return null;
                 });
             }
 
-            public ExclusiveResourceTask<TResult?> ThenAsync<TResult>(Func<CancellationToken, ValueTask<TResult?>> taskFactory)
+            public ExclusiveResourceTask<TResult?> ThenAsync<TResult>(Func<ValueTask<TResult?>> taskFactory)
             {
                 return AwaitableAccess(
                     resources: this.resources,
-                    cancellationOption: this.cancellationOption,
+                    cancellationToken: this.cancellationToken,
                     waitingTimeout: this.waitingTimeout,
                     taskFactory: taskFactory);
             }
         }
 
-        public readonly struct CancellationOption
+        internal sealed class WaitingCancellationOptions
         {
-            public CancellationToken Token { get; init; }
-            public bool SuppressException { get; init; } 
+            private readonly TaskCompletionSource<object?> tcs = new();
+            private CancellationTokenRegistration tokenRegistration;
+            private int disposed = 0;
+            public Task Task => this.tcs.Task;
+
+            public static WaitingCancellationOptions? CreateIfNeed(
+                Task previousTask,
+                TimeSpan? timeout,
+                CancellationToken token)
+            {
+                WaitingCancellationOptions? options = null;
+
+                if (token != default(CancellationToken))
+                {
+                    options ??= new();
+                    options.tokenRegistration = token.Register(() =>
+                    {
+                        options.tcs.TrySetException(new WaitingCanceledException(token));
+                        options.Dispose();
+                    });
+                }
+
+                if (timeout != null && timeout.Value > TimeSpan.Zero)
+                {
+                    options ??= new();
+                    Task.WhenAny(options.tcs.Task, Task.Delay(timeout.Value))
+                        .ContinueWith(task =>
+                        {
+                            if (task.Result != options.tcs.Task)
+                                options.tcs.TrySetException(new WaitingTimeoutException(timeout.Value, previousTask));
+                            options.Dispose();
+                        });
+                }
+
+                return options;
+            }
+
+            private WaitingCancellationOptions()
+            {
+            }
+
+            public void ThrowIfCanceled()
+            {
+                this.tcs.TrySetResult(null);
+                this.Dispose();
+                this.tcs.Task.GetAwaiter().GetResult();
+            }
+
+            private void Dispose()
+            {
+                if (0 != Interlocked.CompareExchange(ref this.disposed, 1, 0))
+                    return;
+
+                this.tokenRegistration.Dispose();
+            }
         }
 
         public sealed class DebugInformation
@@ -565,16 +616,29 @@ namespace Lib
             public IReadOnlyList<object> DeadlockNodeList { get; }
         }
 
-        public class WaitingTimeoutException : TimeoutException
+        public interface ICanceledException
         {
-            public WaitingTimeoutException(Task? previousTask)
-                : base(previousTask == null ? null : $"PreviousTask.Id is {previousTask.Id}")
+        }
+
+        public class WaitingTimeoutException : TimeoutException, ICanceledException
+        {
+            public WaitingTimeoutException(TimeSpan timeout, Task? previousTask)
+                : base($"Timeout:{timeout}, PreviousTask:{previousTask?.Id}")
             {
-                Debug.Assert((previousTask != null) == (DebugLevel >= 1));
+                this.Timeout = timeout;
                 this.PreviousTask = previousTask;
             }
 
+            public TimeSpan Timeout { get; }
             public Task? PreviousTask { get; }
+        }
+
+        public class WaitingCanceledException : TaskCanceledException, ICanceledException
+        {
+            public WaitingCanceledException(CancellationToken token)
+                : base(null, null, token)
+            {
+            }
         }
     }
 
