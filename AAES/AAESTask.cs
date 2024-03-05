@@ -69,8 +69,7 @@ namespace AAES
             internal Awaiter(AAESTask task)
             {
                 this.internalTask = task.GetInternalTaskForAwaiter();
-                if (AAESDebug.EnableDeadlockDetector)
-                    AAESDebug.DeadlockDetector.CheckDeadlock(task);
+                AAESDebug.DeadlockDetector.CheckDeadlock(task);
             }
 
             public bool IsCompleted => this.internalTask.IsCompleted;
@@ -142,8 +141,7 @@ namespace AAES
             internal ResultAwaiter(AAESTask<TResult?> task)
             {
                 this.internalTask = task.GetInternalTaskForResultAwaiter();
-                if (AAESDebug.EnableDeadlockDetector)
-                    AAESDebug.DeadlockDetector.CheckDeadlock(task);
+                AAESDebug.DeadlockDetector.CheckDeadlock(task);
             }
 
             public bool IsCompleted => this.internalTask.IsCompleted;

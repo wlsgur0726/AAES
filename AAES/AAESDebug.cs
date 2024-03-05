@@ -34,12 +34,11 @@ namespace AAES
 
         public static void EnsureHeldByCurrentInvoker(this AAESResource resource)
         {
-            var invoker = Invoker.Current;
-            if (invoker == null)
-            {
-                Debug.Assert(Disabled);
+            if (Disabled)
                 return;
-            }
+
+            var invoker = Invoker.Current;
+            Debug.Assert(invoker != null);
 
             if (invoker.Held(resource) == false)
                 throw new NotHeldResourceException(resource);
@@ -142,7 +141,7 @@ namespace AAES
         {
             public static void BeginTask(AAESTask task)
             {
-                if (task.DebugInfo == null)
+                if (EnableDeadlockDetector == false)
                     return;
 
                 Invoker.BeginInvoke(task);
@@ -160,7 +159,7 @@ namespace AAES
 
             public static void EndTask(AAESTask task)
             {
-                if (task.DebugInfo == null)
+                if (EnableDeadlockDetector == false)
                     return;
 
                 Invoker.EndInvoke(task);
@@ -177,6 +176,7 @@ namespace AAES
 
                 if (CaptureChildTask)
                 {
+                    Debug.Assert(task.DebugInfo != null);
                     var removed = task.DebugInfo.Creator.ChildTasks.TryRemove(new(task.Id, task));
                     Debug.Assert(removed);
                 }
@@ -184,6 +184,9 @@ namespace AAES
 
             public static void CheckDeadlock(AAESTask task)
             {
+                if (EnableDeadlockDetector == false)
+                    return;
+
                 if (task.IsCompleted)
                     return;
 
