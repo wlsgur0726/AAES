@@ -252,7 +252,7 @@ namespace AAES.Test
 
             try
             {
-                AAESDebug.UnhandledExceptionHandler += handler;
+                AAESTask.UnhandledExceptionHandler += handler;
                 ThreadPool.UnsafeQueueUserWorkItem(_ =>
                 {
                     new AAESResource().Access.Then(() => throw new InvalidOperationException(expectedMessage));
@@ -263,7 +263,7 @@ namespace AAES.Test
             }
             finally
             {
-                AAESDebug.UnhandledExceptionHandler -= handler;
+                AAESTask.UnhandledExceptionHandler -= handler;
             }
         }
 

@@ -11,6 +11,8 @@ namespace AAES
 {
     public abstract class AAESTask
     {
+        public static event Func<Exception, bool>? UnhandledExceptionHandler;
+
         public IReadOnlyList<AAESResource> ResourceList { get; }
         internal WaitingCancellationOptions? WaitingCancellationOptions { get; }
         internal DebugInformation? DebugInfo { get; }
@@ -47,7 +49,7 @@ namespace AAES
             catch (WaitingCanceledException ex) when (ex.CancellationToken == ignore)
             {
             }
-            catch (Exception ex) when (AAESDebug.UnhandledExceptionHandler?.Invoke(ex) ?? false)
+            catch (Exception ex) when (UnhandledExceptionHandler?.Invoke(ex) ?? false)
             {
             }
         }

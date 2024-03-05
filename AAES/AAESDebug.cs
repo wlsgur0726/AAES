@@ -11,7 +11,6 @@ namespace AAES
     public static class AAESDebug
     {
         public static readonly int DebugLevel;
-        public static Func<Exception, bool>? UnhandledExceptionHandler;
 
         static AAESDebug()
         {
