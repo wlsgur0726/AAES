@@ -1,5 +1,6 @@
 ﻿using AAES;
 using AAES.Exceptions;
+using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.Resources;
 using System;
 using System.Linq;
 using System.Threading;
@@ -191,6 +192,50 @@ namespace AAES.Test
                 t02.AsTask(),
                 t11.AsTask(),
                 t12.AsTask());
+        }
+
+        [Fact]
+        public static async Task EnsureHeldByCurrentInvoker()
+        {
+            if (AAESDebug.DebugLevel <= 0)
+                return;
+
+            var resources = new[] {
+                new AAESResource(),
+                new AAESResource(),
+            };
+
+            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
+            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+            await resources[0].Access.ThenAsync(async () =>
+            {
+                AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
+                Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+
+                await resources[1].Access.ThenAsync(() =>
+                {
+                    AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
+                    AAESDebug.EnsureHeldByCurrentInvoker(resources[1]);
+                    return default;
+                });
+
+                AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
+                Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+
+                resources[1].Access.Then(async () =>
+                {
+                    await Task.Delay(100);
+                    Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
+                    AAESDebug.EnsureHeldByCurrentInvoker(resources[1]);
+                });
+            });
+
+            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
+            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+
+            // wait for flush ...
+            await resources[0].Access.ThenAsync(() => default);
+            await resources[1].Access.ThenAsync(() => default);
         }
 
         [Fact]

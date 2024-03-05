@@ -5,7 +5,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
-using static AAES.AAESDebug;
 
 namespace AAES
 {
@@ -25,6 +24,19 @@ namespace AAES
 #else
                 DebugLevel = 0;
 #endif
+        }
+
+        public static void EnsureHeldByCurrentInvoker(this AAESResource resource)
+        {
+            var invoker = Invoker.Current;
+            if (invoker == null)
+            {
+                Debug.Assert(DebugLevel <= 0);
+                return;
+            }
+
+            if (invoker.Held(resource) == false)
+                throw new NotHeldResourceException(resource);
         }
 
         internal sealed class Invoker
@@ -80,6 +92,29 @@ namespace AAES
                 removed &= task.DebugInfo.Awaiters.TryRemove(new(this.Id, this));
                 removed &= this.AwaitingTasks.TryRemove(new(task.Id, task));
                 Debug.Assert(removed);
+            }
+
+            public bool Held(AAESResource resource)
+            {
+                var task = this.Task;
+                if (task == null || task.IsCompleted)
+                    return false;
+
+                if (task.ResourceList.Contains(resource))
+                    return true;
+
+                Debug.Assert(task.DebugInfo != null);
+
+                if (task.DebugInfo.Creator.Held(resource))
+                    return true;
+
+                foreach (var otherInvoker in task.DebugInfo.Awaiters.Values)
+                {
+                    if (otherInvoker.Held(resource))
+                        return true;
+                }
+
+                return false;
             }
 
             public override string ToString() => $"{nameof(Invoker)}({this.Id})";

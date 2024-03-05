@@ -5,7 +5,7 @@ using System.Threading.Tasks;
 try
 {
     Console.WriteLine("start");
-    await AdvancedTests.UnhandledExceptionAppDomain();
+    await AdvancedTests.EnsureHeldByCurrentInvoker();
 }
 finally
 {
