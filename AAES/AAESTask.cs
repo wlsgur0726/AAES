@@ -26,7 +26,7 @@ namespace AAES
             this.ResourceList = resourceList;
             this.WaitingCancellationOptions = waitingCancellationOptions;
             this.DebugInfo = creator == null ? null : new(creator, previousTask);
-            Debug.Assert((creator != null) == (AAESDebug.DebugLevel >= 1));
+            Debug.Assert((creator != null) == (AAESDebug.RequiredDebugInfo));
         }
 
         internal abstract Task InternalTask { get; }
@@ -66,7 +66,7 @@ namespace AAES
             internal Awaiter(AAESTask task)
             {
                 this.internalTask = task.GetInternalTaskForAwaiter();
-                if (task.DebugInfo != null)
+                if (AAESDebug.EnableDeadlockDetector)
                     AAESDebug.DeadlockDetector.CheckDeadlock(task);
             }
 

@@ -10,18 +10,24 @@ namespace AAES
 {
     public static class AAESDebug
     {
-        public static readonly int DebugLevel;
+        public static readonly int Level;
+
+        public static bool Disabled => Level <= 0;
+        public static bool EnableDeadlockDetector => Level >= 1;
+        public static bool RequiredDebugInfo => EnableDeadlockDetector;
+        public static bool StrictHeldChecking => Level >= 2;
+        public static bool CaptureChildTask => Level >= 2;
 
         static AAESDebug()
         {
-            var debugLevelStr = Environment.GetEnvironmentVariable("AAES_DEBUG_LEVEL");
-            if (int.TryParse(debugLevelStr, out var debugLevel))
-                DebugLevel = debugLevel;
+            var lvStr = Environment.GetEnvironmentVariable("AAES_DEBUG_LEVEL");
+            if (int.TryParse(lvStr, out var level))
+                Level = level;
             else
 #if DEBUG
-                DebugLevel = int.MaxValue;
+                Level = int.MaxValue;
 #else
-                DebugLevel = 0;
+                Level = 0;
 #endif
         }
 
@@ -30,7 +36,7 @@ namespace AAES
             var invoker = Invoker.Current;
             if (invoker == null)
             {
-                Debug.Assert(DebugLevel <= 0);
+                Debug.Assert(Disabled);
                 return;
             }
 
@@ -44,7 +50,7 @@ namespace AAES
             private static int lastId;
 
             public static Invoker Root { get; } = new();
-            public static Invoker? Current => DebugLevel >= 1
+            public static Invoker? Current => RequiredDebugInfo
                 ? (asyncLocal.Value ?? Root)
                 : null;
 
@@ -104,13 +110,16 @@ namespace AAES
 
                 Debug.Assert(task.DebugInfo != null);
 
-                if (task.DebugInfo.Creator.Held(resource))
-                    return true;
-
-                foreach (var otherInvoker in task.DebugInfo.Awaiters.Values)
+                if (StrictHeldChecking == false)
                 {
-                    if (otherInvoker.Held(resource))
+                    if (task.DebugInfo.Creator.Held(resource))
                         return true;
+
+                    foreach (var otherInvoker in task.DebugInfo.Awaiters.Values)
+                    {
+                        if (otherInvoker.Held(resource))
+                            return true;
+                    }
                 }
 
                 return false;
@@ -156,7 +165,7 @@ namespace AAES
                     Debug.Assert(exchanged == task);
                 }
 
-                if (DebugLevel >= 2)
+                if (CaptureChildTask)
                 {
                     var removed = task.DebugInfo.Creator.ChildTasks.TryRemove(new(task.Id, task));
                     Debug.Assert(removed);

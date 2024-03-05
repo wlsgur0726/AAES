@@ -135,7 +135,7 @@ namespace AAES
                 previousTask,
                 invoker);
 
-            if (AAESDebug.DebugLevel >= 2)
+            if (AAESDebug.CaptureChildTask)
             {
                 Debug.Assert(invoker != null);
                 var added = invoker.ChildTasks.TryAdd(task.Id, task);

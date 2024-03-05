@@ -23,7 +23,7 @@ namespace AAES
             [CallerFilePath] string filePath = "",
             [CallerLineNumber] int lineNumber = 0)
         {
-            if (AAESDebug.DebugLevel >= 1)
+            if (AAESDebug.RequiredDebugInfo)
                 this.DebugInfo = new(filePath, lineNumber);
         }
 

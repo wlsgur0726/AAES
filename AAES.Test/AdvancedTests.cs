@@ -69,7 +69,7 @@ namespace AAES.Test
                     Console.WriteLine("222");
                 });
                 await Assert.ThrowsAsync(
-                    AAESDebug.DebugLevel >= 1
+                    AAESDebug.EnableDeadlockDetector
                         ? typeof(DeadlockDetectedException)
                         : typeof(TimeoutException),
                     () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500)));
@@ -137,7 +137,7 @@ namespace AAES.Test
                         return default;
                     });
                     await Assert.ThrowsAsync(
-                        AAESDebug.DebugLevel >= 1
+                        AAESDebug.EnableDeadlockDetector
                             ? typeof(DeadlockDetectedException)
                             : typeof(TimeoutException),
                         () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(100)));
@@ -197,7 +197,7 @@ namespace AAES.Test
         [Fact]
         public static async Task EnsureHeldByCurrentInvoker()
         {
-            if (AAESDebug.DebugLevel <= 0)
+            if (AAESDebug.Disabled)
                 return;
 
             var resources = new[] {
@@ -214,7 +214,10 @@ namespace AAES.Test
 
                 await resources[1].Access.ThenAsync(() =>
                 {
-                    AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
+                    if (AAESDebug.StrictHeldChecking)
+                        Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
+                    else
+                        AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
                     AAESDebug.EnsureHeldByCurrentInvoker(resources[1]);
                     return default;
                 });
