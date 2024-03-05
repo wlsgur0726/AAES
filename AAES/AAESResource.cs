@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -20,16 +19,22 @@ namespace AAES
         private Task? lastTask;
 
         public AAESResource(
-            [CallerFilePath] string filePath = "",
-            [CallerLineNumber] int lineNumber = 0)
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
         {
             if (AAESDebug.RequiredDebugInfo)
-                this.DebugInfo = new(filePath, lineNumber);
+            {
+                this.DebugInfo = new(new()
+                {
+                    FilePath = callerFilePath,
+                    LineNumber = callerLineNumber,
+                });
+            }
         }
 
         public override string ToString() => this.DebugInfo == null
             ? $"{nameof(AAESResource)}({this.Id})"
-            : $"{nameof(AAESResource)}:{this.DebugInfo}({this.Id})";
+            : $"{nameof(AAESResource)}:{this.DebugInfo.Caller}({this.Id})";
 
         public AAESTaskBuilder Access => AccessTo(this);
         public static AAESTaskBuilder AccessTo(params AAESResource[] resources) => new(resources);
@@ -133,18 +138,13 @@ namespace AAES
 
         public sealed class DebugInformation
         {
-            public readonly string FilePath;
-            public readonly int LineNumber;
+            public readonly AAESDebug.Caller Caller;
             internal AAESTask? Holder;
 
-            internal DebugInformation(string filePath, int lineNumber)
+            internal DebugInformation(AAESDebug.Caller caller)
             {
-                this.FilePath = filePath;
-                this.LineNumber = lineNumber;
+                this.Caller = caller;
             }
-
-            public override string ToString()
-                => $"{Path.GetFileName(this.FilePath)}:{this.LineNumber}";
         }
     }
 }

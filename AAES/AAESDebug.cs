@@ -3,6 +3,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 
@@ -42,6 +43,15 @@ namespace AAES
 
             if (invoker.Held(resource) == false)
                 throw new NotHeldResourceException(resource);
+        }
+
+        public readonly struct Caller
+        {
+            public string? FilePath { get; init; }
+            public int LineNumber { get; init; }
+            public override string ToString() => this.FilePath == null
+                ? string.Empty
+                : $"{Path.GetFileName(this.FilePath)}:{this.LineNumber}";
         }
 
         internal sealed class Invoker
@@ -205,7 +215,7 @@ namespace AAES
                 }
             }
 
-            static IReadOnlyList<object>? TraversialRAG(
+            private static IReadOnlyList<object>? TraversialRAG(
                 AAESTask task,
                 List<object> footprints)
             {

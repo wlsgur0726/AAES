@@ -21,11 +21,12 @@ namespace AAES
             IReadOnlyList<AAESResource> resourceList,
             WaitingCancellationOptions? waitingCancellationOptions,
             Task previousTask,
+            AAESDebug.Caller caller,
             AAESDebug.Invoker? creator)
         {
             this.ResourceList = resourceList;
             this.WaitingCancellationOptions = waitingCancellationOptions;
-            this.DebugInfo = creator == null ? null : new(creator, previousTask);
+            this.DebugInfo = creator == null ? null : new(caller, creator, previousTask);
             Debug.Assert((creator != null) == (AAESDebug.RequiredDebugInfo));
         }
 
@@ -37,7 +38,9 @@ namespace AAES
         public bool IsCanceled => this.InternalTask.IsCanceled || (this.Exception?.InnerException is ICanceledException);
         public bool IsCompletedSuccessfully => this.InternalTask.IsCompletedSuccessfully;
 
-        public override string ToString() => $"{nameof(AAESTask)}({this.Id})";
+        public override string ToString() => this.DebugInfo == null
+            ? $"{nameof(AAESTask)}({this.Id})"
+            : $"{nameof(AAESTask)}:{this.DebugInfo.Caller}({this.Id})";
 
         internal async void Forget(CancellationToken ignore)
         {
@@ -78,15 +81,18 @@ namespace AAES
 
         internal sealed class DebugInformation
         {
+            public AAESDebug.Caller Caller { get; }
             public AAESDebug.Invoker Creator { get; }
             public ConcurrentDictionary<int, AAESDebug.Invoker> Awaiters { get; } = new();
             public AAESDebug.Invoker? Invoker { get; set; }
             public Task PreviousTask { get; }
 
             public DebugInformation(
+                AAESDebug.Caller caller,
                 AAESDebug.Invoker creator,
                 Task previousTask)
             {
+                this.Caller = caller;
                 this.Creator = creator;
                 this.PreviousTask = previousTask;
             }
@@ -102,8 +108,9 @@ namespace AAES
             IReadOnlyList<AAESResource> resourceList,
             WaitingCancellationOptions? waitingCancellationOptions,
             Task previousTask,
+            AAESDebug.Caller caller,
             AAESDebug.Invoker? creator)
-            : base(resourceList, waitingCancellationOptions, previousTask, creator)
+            : base(resourceList, waitingCancellationOptions, previousTask, caller, creator)
         {
             this.Tcs = tcs;
         }
@@ -120,7 +127,7 @@ namespace AAES
         protected override Task AsTaskImpl() => this.AsTask();
         new public Task<TResult?> AsTask()
         {
-            return this.DebugInfo != null
+            return AAESDebug.EnableDeadlockDetector
                 ? WrapForDeadlockDetector(this)
                 : this.GetInternalTaskForResultAwaiter();
 
@@ -135,7 +142,7 @@ namespace AAES
             internal ResultAwaiter(AAESTask<TResult?> task)
             {
                 this.internalTask = task.GetInternalTaskForResultAwaiter();
-                if (task.DebugInfo != null)
+                if (AAESDebug.EnableDeadlockDetector)
                     AAESDebug.DeadlockDetector.CheckDeadlock(task);
             }
 

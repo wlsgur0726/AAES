@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -39,33 +40,47 @@ namespace AAES
         }
 
         /// <inheritdoc cref="Build"/>
-        public void Then(Func<ValueTask> taskFactory)
+        public void Then(
+            Func<ValueTask> taskFactory,
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
         {
-            this.ThenAsync(taskFactory)
+            this.ThenAsync(taskFactory, callerFilePath, callerLineNumber)
                 .Forget(this.cancellationToken);
         }
 
         /// <inheritdoc cref="Build"/>
-        public AAESTask ThenAsync(Func<ValueTask> taskFactory)
+        public AAESTask ThenAsync(
+            Func<ValueTask> taskFactory,
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
         {
             if (taskFactory == null)
                 throw new ArgumentNullException(nameof(taskFactory));
 
-            return this.ThenAsync<object>(async () =>
-            {
-                await taskFactory.Invoke();
-                return null;
-            });
+            return this.ThenAsync<object>(
+                async () =>
+                {
+                    await taskFactory.Invoke();
+                    return null;
+                },
+                callerFilePath,
+                callerLineNumber);
         }
 
         /// <inheritdoc cref="Build"/>
-        public AAESTask<TResult?> ThenAsync<TResult>(Func<ValueTask<TResult?>> taskFactory)
+        public AAESTask<TResult?> ThenAsync<TResult>(
+            Func<ValueTask<TResult?>> taskFactory,
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
         {
             return Build(
                 resources: this.resources,
                 waitingTimeout: this.waitingTimeout,
                 cancellationToken: this.cancellationToken,
-                taskFactory: taskFactory);
+                taskFactory: taskFactory,
+                callerFilePath: callerFilePath,
+                callerLineNumber: callerLineNumber);
         }
 
         /// <summary>
@@ -104,7 +119,9 @@ namespace AAES
             IEnumerable<AAESResource> resources,
             TimeSpan? waitingTimeout,
             CancellationToken cancellationToken,
-            Func<ValueTask<TResult?>> taskFactory)
+            Func<ValueTask<TResult?>> taskFactory,
+            [CallerFilePath] string callerFilePath = "",
+            [CallerLineNumber] int callerLineNumber = 0)
         {
             if (taskFactory == null)
                 throw new ArgumentNullException(nameof(taskFactory));
@@ -133,6 +150,11 @@ namespace AAES
                 resourceList,
                 waitingCancellationOptions,
                 previousTask,
+                new()
+                {
+                    FilePath = callerFilePath,
+                    LineNumber = callerLineNumber,
+                },
                 invoker);
 
             if (AAESDebug.CaptureChildTask)
