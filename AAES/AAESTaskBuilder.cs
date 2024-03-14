@@ -58,14 +58,13 @@ namespace AAES
             if (taskFactory == null)
                 throw new ArgumentNullException(nameof(taskFactory));
 
-            return this.ThenAsync<object>(
-                async () =>
-                {
-                    await taskFactory.Invoke();
-                    return null;
-                },
-                callerFilePath,
-                callerLineNumber);
+            return this.ThenAsync(Wrapper, callerFilePath, callerLineNumber);
+
+            async ValueTask<object?> Wrapper()
+            {
+                await taskFactory.Invoke().ConfigureAwait(false);
+                return null;
+            }
         }
 
         /// <inheritdoc cref="Build"/>
@@ -138,7 +137,6 @@ namespace AAES
                 .Distinct()
                 /// for <see cref="AAESResource.Locked"/>
                 .OrderBy(e => e.Id)
-                .ThenBy(e => e.GetHashCode())
                 .ToList();
 
             var tcs = new TaskCompletionSource<TResult?>();
@@ -165,9 +163,17 @@ namespace AAES
             }
 
             if (previousTask.IsCompleted)
+            {
                 Invoke(taskFactory, task);
+            }
             else
-                previousTask.ContinueWith(_ => Invoke(taskFactory, task));
+            {
+                var taskContOpts = TaskContinuationOptions.DenyChildAttach;
+                #if !DEBUG // 이 옵션을 사용하면 call-stack이 너무 깊어져 디버깅이 불편해지는 경우가 생김
+                taskContOpts |= TaskContinuationOptions.ExecuteSynchronously;
+                #endif
+                previousTask.ContinueWith(_ => Invoke(taskFactory, task), taskContOpts);
+            }
 
             return task;
         }
@@ -183,7 +189,7 @@ namespace AAES
                 AAESDebug.DeadlockDetector.BeginTask(task);
 
                 task.WaitingCancellationOptions?.ThrowIfCanceled();
-                result = await taskFactory.Invoke();
+                result = await taskFactory.Invoke().ConfigureAwait(false);
             }
             catch (Exception ex)
             {

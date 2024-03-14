@@ -47,7 +47,7 @@ namespace AAES
             /// for <see cref="UnhandledExceptionEventHandler"/>
             try
             {
-                await this.InternalTask;
+                await this.InternalTask.ConfigureAwait(false);
             }
             catch (WaitingCanceledException ex) when (ex.CancellationToken == ignore)
             {

@@ -11,8 +11,8 @@ namespace AAES
 {
     public sealed class AAESResource
     {
-        private static int LastId;
-        public int Id { get; } = Interlocked.Increment(ref LastId);
+        private static long LastId;
+        public long Id { get; } = Interlocked.Increment(ref LastId);
         public DebugInformation? DebugInfo { get; }
 
         private static readonly Task Locked = new(() => throw new InvalidOperationException());
