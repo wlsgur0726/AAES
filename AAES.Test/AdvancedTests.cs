@@ -1,158 +1,126 @@
-﻿using AAES;
-using AAES.Exceptions;
-using Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.Resources;
+﻿using AAES.Exceptions;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AAES.Test
 {
-    public static class AdvancedTests
+    public class AdvancedTests
     {
-        [Theory]
-        [InlineData(3, 5, 100)]
-        [InlineData(100, 100, 1000)]
-        public static async Task AccessToMultipleResources(int resourceCount, int accessorCount, int testTimeMs)
+        private readonly ITestOutputHelper output;
+        public AdvancedTests(ITestOutputHelper output)
         {
-            var testTime = TimeSpan.FromMilliseconds(testTimeMs);
-
-            var resources = Enumerable
-                .Range(0, resourceCount)
-                .Select(_ => new AAESResource())
-                .ToList();
-
-            var startedAt = DateTime.UtcNow;
-            await Task.WhenAll(Enumerable
-                .Range(0, accessorCount)
-                .Select(_ => Task.Run(async () =>
-                {
-                    var random = new Random();
-                    var shuffledResources = resources.ToList();
-                    AAESTask lastTask;
-                    do
-                    {
-                        for (var i = 0; i < shuffledResources.Count; i++)
-                        {
-                            var swapIdx = random.Next(shuffledResources.Count);
-                            var temp = shuffledResources[i];
-                            shuffledResources[i] = shuffledResources[swapIdx];
-                            shuffledResources[swapIdx] = temp;
-                        }
-
-                        lastTask = AAESResource
-                            .AccessTo(shuffledResources)
-                            .ThenAsync(() => default);
-
-                    } while (DateTime.UtcNow - startedAt < testTime);
-
-                    await lastTask;
-                })))
-                .WaitAsync(testTime + TimeSpan.FromSeconds(3));
+            this.output = output;
         }
 
+        /// <summary>
+        /// 셀프 데드락 사례와 <see cref="AAESDebug.DeadlockDetector"/>의 감지 기능 테스트
+        /// </summary>
         [Fact]
-        public static async Task SelfDeadlock()
+        public async Task SelfDeadlock()
         {
-            var resources = new[] {
-                new AAESResource(),
-                new AAESResource(),
-            };
+            var resource = new AAESResource();
 
-            var task = AAESResource.AccessTo(resources).ThenAsync(async () =>
+            var task = resource.Access.ThenAsync(async () =>
             {
-                Console.WriteLine("111");
-                var innerTask = resources[1].Access.ThenAsync(async () =>
+                this.output.WriteLine("a");
+
+                /// 동일한 resource를 점유하는 innerTask 생성
+                var innerTask = resource.Access.ThenAsync(async () =>
                 {
                     await Task.Delay(1);
-                    Console.WriteLine("222");
+                    this.output.WriteLine("b");
                 });
+
+                /// task가 innerTask를 await하면 데드락. innerTask는 task가 종료되기 전까지 실행되지 않는다.
+                /// <see cref="AAESDebug.Level"/>이 활성화 되어있으면 즉시 감지되어야 한다.
+                /// <see cref="AAESDebug.Level"/> 비활성에 타임아웃 처리도 하지 않는다면 관련 task들은 영원히 종료되지 않는다.
                 await Assert.ThrowsAsync(
                     AAESDebug.EnableDeadlockDetector
                         ? typeof(DeadlockDetectedException)
                         : typeof(TimeoutException),
                     () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500)));
-                Console.WriteLine("333");
+
+                this.output.WriteLine("c");
             });
 
             await task.AsTask().WaitAsync(TimeSpan.FromMilliseconds(1000));
+
+            // wait for flush ...
+            await resource.Access.ThenAsync(() => default);
         }
 
+        /// <summary>
+        /// 교차 데드락 사례와 <see cref="AAESDebug.DeadlockDetector"/>의 감지 기능 테스트
+        /// </summary>
         [Fact]
-        public static async Task CrossDeadlock()
+        public async Task CrossDeadlock()
         {
-            var resources = new[] {
-                new AAESResource(),
-                new AAESResource(),
-            };
+            var r1 = new AAESResource();
+            var r2 = new AAESResource();
 
-            for (var i = 0; i < 5; ++i)
+            var t1 = r1.Access.ThenAsync(async () =>
             {
-                var a = i % 2;
-                var b = 1 - (i % 2);
+                this.output.WriteLine("[t1] held r1");
 
-                var calledInnerTasks = new[] {
-                    new TaskCompletionSource<object?>(),
-                    new TaskCompletionSource<object?>(),
-                };
+                /// t1의 r2점유 시도 전에 t2가 r2를 점유한 상태를 연출하기 위한 딜레이
+                await Task.Delay(100);
 
-                var task1 = resources[a].Access.ThenAsync(async () =>
+                var innerTask = r2.Access.ThenAsync(() =>
                 {
-                    Console.WriteLine("a");
-
-                    // task2가 먼저 a를 점유한 상태에서 시도하기 위한 딜레이
-                    await Task.Delay(100);
-
-                    // task2보다 먼저 await를 시도하므로 순환을 감지하지 못한다.
-                    // (task2가 미래에 무엇을 await할지 예측 불가)
-                    var innerTask = resources[b].Access.ThenAsync(() =>
-                    {
-                        // task2가 exception으로 인해 종료되면 실행된다.
-                        Console.WriteLine("and b");
-                        calledInnerTasks[b].SetResult(null);
-                        return default;
-                    });
-                    await innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500));
-
-                    Console.WriteLine("a fin");
+                    /// 데드락 여부와 무관하게 예약은 무조건 이뤄지므로 데드락이 해결되면 이 함수도 실행된다.
+                    /// 본 예제는 t2가 exception으로 인해 종료되고, 그로 인해 r2가 relelase된 후 실행된다.
+                    this.output.WriteLine("[t1] held r2");
+                    return default;
                 });
+                /// t2보다 먼저 await를 시도하므로 순환을 감지하지 못한다.
+                /// (t2가 미래에 무엇을 await할지 예측 불가)
+                await innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(500));
 
-                var task2 = resources[b].Access.ThenAsync(async () =>
+                this.output.WriteLine("[t1] release r1");
+            });
+
+            var t2 = r2.Access.ThenAsync(async () =>
+            {
+                this.output.WriteLine("[t2] held r2");
+
+                /// t1의 innerTask보다 늦게 시도하기 위한 딜레이.
+                await Task.Delay(200);
+
+                var innerTask = r1.Access.ThenAsync(() =>
                 {
-                    Console.WriteLine("b");
-
-                    // 데드락 감지기능 테스트를 위해 task1의 innerTask보다 늦게 시도하기 위한 딜레이
-                    await Task.Delay(200);
-
-                    // task1이 await 중인 상태에서 시도하므로 데드락.
-                    // DebugLevel이 활성화 되어있으면 즉시 감지되어야 한다.
-                    // DebugLevel 비활성에 타임아웃 처리도 하지 않는다면 관련 task들은 영원히 종료되지 않는다.
-                    var innerTask = resources[a].Access.ThenAsync(() =>
-                    {
-                        // 데드락 여부와 무관하게 예약은 무조건 이뤄지므로 데드락이 해결되면 이 함수도 실행된다.
-                        // 본 예제는 task2가 exception으로 인해 종료되고, 그로 인해 task1이 종료된 후 점유 성공한다.
-                        Console.WriteLine("and a");
-                        calledInnerTasks[a].SetResult(null);
-                        return default;
-                    });
-                    await Assert.ThrowsAsync(
-                        AAESDebug.EnableDeadlockDetector
-                            ? typeof(DeadlockDetectedException)
-                            : typeof(TimeoutException),
-                        () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(100)));
-
-                    Console.WriteLine("b fin");
+                    /// 데드락 여부와 무관하게 예약은 무조건 이뤄지므로 데드락이 해결되면 이 함수도 실행된다.
+                    /// t2의 exception으로 r2 release, t1의 innerTask 실행 완료 후 r1 release 후 실행된다.
+                    this.output.WriteLine("[t2] held r1");
+                    return default;
                 });
+                /// r1을 점유한 t1이 r2를 await 중인 상태에서 시도하므로 데드락.
+                /// <see cref="AAESDebug.Level"/>이 활성화 되어있으면 즉시 감지되어야 한다.
+                /// <see cref="AAESDebug.Level"/> 비활성에 타임아웃 처리도 하지 않는다면 관련 task들은 영원히 종료되지 않는다.
+                await Assert.ThrowsAsync(
+                    AAESDebug.EnableDeadlockDetector
+                        ? typeof(DeadlockDetectedException)
+                        : typeof(TimeoutException),
+                    () => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(100)));
 
-                await Task.WhenAll(task1.AsTask(), task2.AsTask()).WaitAsync(TimeSpan.FromMilliseconds(1000));
-                await Task.WhenAll(calledInnerTasks.Select(e => e.Task)).WaitAsync(TimeSpan.FromMilliseconds(100));
-                Console.WriteLine("-----");
-            }
+                this.output.WriteLine("[t2] release r2");
+            });
+
+            await Task.WhenAll(t1.AsTask(), t2.AsTask()).WaitAsync(TimeSpan.FromMilliseconds(1000));
+
+            // wait for flush ...
+            await AAESResource.AccessTo(r1, r2).ThenAsync(() => default);
         }
 
+        /// <summary>
+        /// <see cref="AAESDebug.DeadlockDetector"/>의 오진 여부를 확인하기 위한 테스트
+        /// </summary>
         [Fact]
-        public static async Task Join()
+        public async Task IsNotDeadlock()
         {
             var resources = new[] {
                 new AAESResource(),
@@ -162,87 +130,167 @@ namespace AAES.Test
             var t01 = resources[0].Access.ThenAsync(async () =>
             {
                 await Task.Delay(100);
-                Console.WriteLine("t01");
+                this.output.WriteLine("t01");
             });
 
-            var t11 = resources[1].Access.ThenAsync(async () =>
+            var t02 = resources[1].Access.ThenAsync(async () =>
             {
                 await Task.Delay(100);
-                Console.WriteLine("t11");
+                this.output.WriteLine("t02");
             });
 
-            var t02 = resources[0].Access.ThenAsync(async () =>
+            var t11 = resources[0].Access.ThenAsync(async () =>
             {
-                //await Task.Delay(100);
-                await t11;
-                Console.WriteLine("t02");
+                await t02;
+                await Task.Delay(100);
+                this.output.WriteLine("t11");
             });
 
             var t12 = resources[1].Access.ThenAsync(async () =>
             {
-                //await Task.Delay(100);
                 await t01;
-                Console.WriteLine("t12");
+                await Task.Delay(100);
+                this.output.WriteLine("t12");
             });
 
-            //await Task.Delay(200);
+            var tasks = new[] { t01, t02, t11, t12 };
 
             await Task.WhenAll(
-                t01.AsTask(),
-                t02.AsTask(),
-                t11.AsTask(),
-                t12.AsTask());
+                Task.WhenAll(tasks.Select(t => t.AsTask())),
+                Task.Run(async () =>
+                {
+                    await Task.Delay(150);
+                    await Task.WhenAll(tasks.Select(t => t.AsTask()));
+                }))
+                .WaitAsync(TimeSpan.FromMilliseconds(1000));
         }
 
+        /// <summary>
+        /// <see cref="AAESDebug.EnsureHeldByCurrentInvoker"/> 기능 테스트
+        /// </summary>
         [Fact]
-        public static async Task EnsureHeldByCurrentInvoker()
+        public async Task EnsureHeldByCurrentInvoker()
         {
             if (AAESDebug.Disabled)
                 return;
 
-            var resources = new[] {
-                new AAESResource(),
-                new AAESResource(),
-            };
+            var r1 = new AAESResource();
+            var r2 = new AAESResource();
 
-            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
-            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
-            await resources[0].Access.ThenAsync(async () =>
+            /// 모두 점유중이 아니므로 exception 발생
+            Assert.Throws<NotHeldResourceException>(() => r1.EnsureHeldByCurrentInvoker());
+            Assert.Throws<NotHeldResourceException>(() => r2.EnsureHeldByCurrentInvoker());
+
+            await r1.Access.ThenAsync(async () =>
             {
-                AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
-                Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+                /// r1 점유중이므로 exception 발생하지 않음
+                r1.EnsureHeldByCurrentInvoker();
+                /// r2 점유중이 아니므로 exception 발생
+                Assert.Throws<NotHeldResourceException>(() => r2.EnsureHeldByCurrentInvoker());
 
-                await resources[1].Access.ThenAsync(() =>
+                var innerTask = r2.Access.ThenAsync(async () =>
                 {
+                    /// r2 점유중이므로 exception 발생하지 않음
+                    r2.EnsureHeldByCurrentInvoker();
+
+                    /// 이 task의 awaiter가 점유한 resource인지 확인하는 동작은 <see cref="AAESDebug.Level"/>에 따라 다름.
                     if (AAESDebug.StrictHeldChecking)
-                        Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
+                    {
+                        /// awaiter가 언제 종료될지 예상 불가능하므로 보수적인 판정.
+                        Assert.Throws<NotHeldResourceException>(() => r1.EnsureHeldByCurrentInvoker());
+                    }
                     else
-                        AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
-                    AAESDebug.EnsureHeldByCurrentInvoker(resources[1]);
-                    return default;
+                    {
+                        /// 이 task가 종료되기 전에 awaiter가 먼저 종료되는 일은 없을 것이란 가정으로 너그럽게 판정.
+                        r1.EnsureHeldByCurrentInvoker();
+                    }
+
+                    /// 이 task의 awaiter가 먼저 종료되는 상황을 연출
+                    await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+                    Assert.Throws<NotHeldResourceException>(() => r1.EnsureHeldByCurrentInvoker());
+                    r2.EnsureHeldByCurrentInvoker();
                 });
 
-                AAESDebug.EnsureHeldByCurrentInvoker(resources[0]);
-                Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+                /// innerTask의 완료를 기다리지 못하고 종료
+                await Assert.ThrowsAsync<TimeoutException>(() => innerTask.AsTask().WaitAsync(TimeSpan.FromMilliseconds(50)));
 
-                resources[1].Access.Then(async () =>
-                {
-                    await Task.Delay(100);
-                    Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
-                    AAESDebug.EnsureHeldByCurrentInvoker(resources[1]);
-                });
+                r1.EnsureHeldByCurrentInvoker();
+                Assert.Throws<NotHeldResourceException>(() => r2.EnsureHeldByCurrentInvoker());
             });
 
-            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[0]));
-            Assert.Throws<NotHeldResourceException>(() => AAESDebug.EnsureHeldByCurrentInvoker(resources[1]));
+            Assert.Throws<NotHeldResourceException>(() => r1.EnsureHeldByCurrentInvoker());
+            Assert.Throws<NotHeldResourceException>(() => r2.EnsureHeldByCurrentInvoker());
 
             // wait for flush ...
-            await resources[0].Access.ThenAsync(() => default);
-            await resources[1].Access.ThenAsync(() => default);
+            await r1.Access.ThenAsync(() => default);
+            await r2.Access.ThenAsync(() => default);
+        }
+
+        [Theory]
+        [InlineData(1, 4, 4, 10000)]
+        [InlineData(2, 10, 20, 10000)]
+        [InlineData(3, 1000, 100, 100)]
+        public async Task MultipleResourceAccess(int randomSeed, int resourceCount, int publisherCount, int publishCount)
+        {
+            var resources = Enumerable.Range(0, resourceCount)
+                .Select(_ => new AAESResource())
+                .ToList();
+
+            var expectedCounter = new long[resourceCount];
+            {
+                var random = new Random(randomSeed);
+                for (var i = 0; i < publishCount; ++i)
+                {
+                    var indexList = SelectResourceIndex(random);
+                    foreach (var index in indexList)
+                        expectedCounter[index] += publisherCount;
+                }
+            }
+
+            var actualCounter = new long[resourceCount];
+            var publisherList = Enumerable.Range(0, publisherCount)
+                .Select(_ => new Thread(() =>
+                {
+                    var random = new Random(randomSeed);
+                    for (var i = 0; i < publishCount; ++i)
+                    {
+                        var indexList = SelectResourceIndex(random);
+                        AAESResource.AccessTo(indexList.Select(i => resources[i])).Then(() =>
+                        {
+                            foreach (var index in indexList)
+                                actualCounter[index] += 1;
+                            return default;
+                        });
+                    }
+                }))
+                .ToList();
+
+            publisherList.ForEach(e => e.Start());
+            publisherList.ForEach(e => e.Join());
+
+            // wait for flush ...
+            await AAESResource.AccessTo(resources).ThenAsync(() => default);
+
+            Assert.Equal(expectedCounter, actualCounter);
+
+            List<int> SelectResourceIndex(Random random)
+            {
+                var count = 1 + random.Next(resourceCount);
+                var indexList = Enumerable.Range(0, resourceCount).ToList();
+                var selectedList = new List<int>(count);
+                for (var i = 0; i < count; ++i)
+                {
+                    var index = random.Next(indexList.Count);
+                    indexList.RemoveAt(index);
+                    selectedList.Add(index);
+                }
+                return selectedList;
+            }
         }
 
         [Fact]
-        public static async Task UnhandledExceptionHandelr()
+        public async Task UnhandledExceptionHandelr()
         {
             var expectedMessage = $"test {nameof(UnhandledExceptionHandelr)} for Forget method. {DateTime.UtcNow.Ticks}";
             var tcs = new TaskCompletionSource<string?>();

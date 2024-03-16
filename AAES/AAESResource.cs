@@ -131,8 +131,11 @@ namespace AAES
         {
             foreach (var resource in resourceList)
             {
-                var exchanged = Interlocked.CompareExchange(ref resource.lastTask, null, finishedTask);
-                Debug.Assert(exchanged != null);
+                if (resource.lastTask == finishedTask)
+                {
+                    var exchanged = Interlocked.CompareExchange(ref resource.lastTask, null, finishedTask);
+                    Debug.Assert(exchanged != null);
+                }
             }
         }
 

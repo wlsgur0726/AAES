@@ -57,6 +57,7 @@ namespace AAES
         {
             private static readonly AsyncLocal<Invoker> asyncLocal = new();
             private static int lastId;
+            private int lastAwaitId;
 
             public static Invoker Root { get; } = new();
             public static Invoker? Current => RequiredDebugInfo
@@ -66,7 +67,7 @@ namespace AAES
             public int Id { get; } = Interlocked.Increment(ref lastId);
             public AAESTask? Task { get; private set; }
             public ConcurrentDictionary<int, AAESTask> ChildTasks { get; } = new();
-            public ConcurrentDictionary<int, AAESTask> AwaitingTasks { get; } = new();
+            public AwaitingContextContainer AwaitingContexts { get; } = new();
 
             public static void BeginInvoke(AAESTask task)
             {
@@ -88,23 +89,34 @@ namespace AAES
                 task.DebugInfo.Invoker = null;
             }
 
-            public void BeginAwait(AAESTask task)
+            public AwaitingContext BeginAwait(AAESTask task)
             {
                 Debug.Assert(task.DebugInfo != null);
 
-                var added = true;
-                added &= this.AwaitingTasks.TryAdd(task.Id, task);
-                added &= task.DebugInfo.Awaiters.TryAdd(this.Id, this);
+                var ctx = new AwaitingContext()
+                {
+                    Invoker = this,
+                    AwaitId = Interlocked.Increment(ref this.lastAwaitId),
+                    Task = task,
+                };
+
+                bool added;
+                added = this.AwaitingContexts.TryAdd(ctx);
                 Debug.Assert(added);
+                added = task.DebugInfo.Awaiters.TryAdd(ctx);
+                Debug.Assert(added);
+
+                return ctx;
             }
 
-            public void EndAwait(AAESTask task)
+            public void EndAwait(AwaitingContext ctx)
             {
-                Debug.Assert(task.DebugInfo != null);
+                Debug.Assert(ctx.Task.DebugInfo != null);
 
-                var removed = true;
-                removed &= task.DebugInfo.Awaiters.TryRemove(new(this.Id, this));
-                removed &= this.AwaitingTasks.TryRemove(new(task.Id, task));
+                bool removed;
+                removed = ctx.Task.DebugInfo.Awaiters.TryRemove(ctx);
+                Debug.Assert(removed);
+                removed = this.AwaitingContexts.TryRemove(ctx);
                 Debug.Assert(removed);
             }
 
@@ -124,7 +136,7 @@ namespace AAES
                     if (task.DebugInfo.Creator.Held(resource))
                         return true;
 
-                    foreach (var otherInvoker in task.DebugInfo.Awaiters.Values)
+                    foreach (var otherInvoker in task.DebugInfo.Awaiters.GetInvokes())
                     {
                         if (otherInvoker.Held(resource))
                             return true;
@@ -194,10 +206,12 @@ namespace AAES
                 Debug.Assert(invoker != null);
                 Debug.Assert(task.DebugInfo != null);
 
-                var needRollback = true;
+                AwaitingContext? rollbackCtx = null;
                 try
                 {
-                    invoker.BeginAwait(task);
+                    var ctx = invoker.BeginAwait(task);
+                    rollbackCtx = ctx;
+
                     while (true)
                     {
                         var deadlockList = TraversialRAG(task, new());
@@ -208,13 +222,13 @@ namespace AAES
                             throw new DeadlockDetectedException(deadlockList);
                     }
 
-                    needRollback = false;
-                    task.InternalTask.ContinueWith(_ => invoker.EndAwait(task));
+                    rollbackCtx = null;
+                    task.InternalTask.ContinueWith(_ => invoker.EndAwait(ctx));
                 }
                 finally
                 {
-                    if (needRollback)
-                        invoker.EndAwait(task);
+                    if (rollbackCtx.HasValue)
+                        invoker.EndAwait(rollbackCtx.Value);
                 }
             }
 
@@ -269,7 +283,7 @@ namespace AAES
                 var invoker = current.DebugInfo.Invoker;
                 if (invoker != null)
                 {
-                    foreach (var otherTask in invoker.AwaitingTasks.Values)
+                    foreach (var otherTask in invoker.AwaitingContexts.GetTasks())
                         foreach (var e in GetNextNodes(otherTask))
                             yield return e;
                 }
@@ -310,6 +324,75 @@ namespace AAES
                 var detectedCircularRef = footprints.Contains(node);
                 footprints.Add(node);
                 return detectedCircularRef == false;
+            }
+        }
+
+        internal readonly struct AwaitingContext : IEquatable<AwaitingContext>
+        {
+            public Invoker Invoker { get; init; }
+            public int AwaitId { get; init; }
+            public AAESTask Task { get; init; }
+
+            public bool Equals(AwaitingContext other)
+                => this.Invoker.Id == other.Invoker.Id && this.AwaitId == other.AwaitId;
+            public override bool Equals(object? obj)
+                => obj is AwaitingContext other && Equals(other);
+            public override int GetHashCode()
+                => (((long)this.Invoker.Id << 32) | (long)this.AwaitId).GetHashCode();
+            public override string ToString()
+                => $"Awaiting({this.Invoker.Id}-{this.AwaitId})";
+        }
+
+        internal sealed class AwaitingContextContainer
+        {
+            private readonly Dictionary<int, HashSet<AwaitingContext>> contextsByTaskId = new();
+
+            public bool TryAdd(AwaitingContext ctx)
+            {
+                lock (this.contextsByTaskId)
+                {
+                    if (this.contextsByTaskId.TryGetValue(ctx.Task.Id, out var set) == false)
+                        this.contextsByTaskId.Add(ctx.Task.Id, set = new());
+                    return set.Add(ctx);
+                }
+            }
+
+            public bool TryRemove(AwaitingContext ctx)
+            {
+                lock (this.contextsByTaskId)
+                {
+                    if (this.contextsByTaskId.TryGetValue(ctx.Task.Id, out var set) == false)
+                        return false;
+
+                    var removed = set.Remove(ctx);
+                    if (set.Count == 0)
+                        this.contextsByTaskId.Remove(ctx.Task.Id);
+
+                    return removed;
+                }
+            }
+
+            public IReadOnlyCollection<AAESTask> GetTasks()
+            {
+                var tasks = new List<AAESTask>(this.contextsByTaskId.Count);
+                lock (this.contextsByTaskId)
+                {
+                    foreach (var set in this.contextsByTaskId.Values)
+                        tasks.Add(set.First().Task);
+                }
+                return tasks;
+            }
+
+            public IReadOnlyCollection<Invoker> GetInvokes()
+            {
+                var invokers = new HashSet<Invoker>();
+                lock (this.contextsByTaskId)
+                {
+                    foreach (var set in this.contextsByTaskId.Values)
+                        foreach (var ctx in set)
+                            invokers.Add(ctx.Invoker);
+                }
+                return invokers;
             }
         }
     }

@@ -6,7 +6,7 @@ using Xunit.Abstractions;
 try
 {
     Console.WriteLine("start");
-    //await AdvancedTests.UnhandledExceptionAppDomain();
+    //await (new AdvancedTests(new ConsoleOutputHelper()).IsNotDeadlock());
     //await (new Performance(new ConsoleOutputHelper()).QueueOverhead(1_000_000));
     await (new Performance(new ConsoleOutputHelper()).Counter("H", 0.1, true, 10.0, 100, 1000, 500, 550));
 }

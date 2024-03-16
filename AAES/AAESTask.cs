@@ -82,7 +82,7 @@ namespace AAES
         {
             public AAESDebug.Caller Caller { get; }
             public AAESDebug.Invoker Creator { get; }
-            public ConcurrentDictionary<int, AAESDebug.Invoker> Awaiters { get; } = new();
+            public AAESDebug.AwaitingContextContainer Awaiters { get; } = new();
             public AAESDebug.Invoker? Invoker { get; set; }
             public Task PreviousTask { get; }
 

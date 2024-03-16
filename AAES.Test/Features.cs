@@ -6,24 +6,74 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AAES.Test
 {
-    public static class Features
+    public sealed class Features
     {
+        private readonly ITestOutputHelper output;
+        public Features(ITestOutputHelper output)
+        {
+            this.output = output;
+        }
+
         [Fact]
-        public static void LikeActorModel()
+        public async Task LikeActorModel()
         {
             var resource = new AAESResource();
             resource.Access.Then(async () =>
             {
                 await Task.Yield();
-                Console.WriteLine("do somthing");
+                this.output.WriteLine("do somthing");
             });
+
+            await Task.Delay(100);
         }
 
         [Fact]
-        public static async Task AwaitableAccess()
+        public async Task AsynchronousAccess()
+        {
+            var resource = new AAESResource();
+
+            var tcs1 = new TaskCompletionSource<object?>();
+            resource.Access.Then(async () =>
+            {
+                await Task.Delay(500);
+                tcs1.SetResult(null);
+            });
+            Assert.False(tcs1.Task.IsCompleted);
+
+            var tcs2 = new TaskCompletionSource<object?>();
+            var tcs3 = new TaskCompletionSource<object?>();
+            var footprints = new List<int>();
+            resource.Access.Then(async () =>
+            {
+                Assert.True(tcs1.Task.IsCompleted);
+                footprints.Add(1);
+
+                resource.Access.Then(() =>
+                {
+                    Assert.True(tcs2.Task.IsCompleted);
+                    footprints.Add(2);
+                    tcs3.SetResult(null);
+                    return default;
+                });
+
+                await Task.Delay(100);
+
+                footprints.Add(3);
+                tcs2.SetResult(null);
+            });
+
+            Assert.False(tcs2.Task.IsCompleted);
+            await tcs3.Task;
+
+            Assert.Equal(new[] { 1, 3, 2 }, footprints);
+        }
+
+        [Fact]
+        public async Task AwaitableAccess()
         {
             var resource = new AAESResource();
             var result = await resource.Access.ThenAsync(async () =>
@@ -32,70 +82,6 @@ namespace AAES.Test
                 return nameof(AwaitableAccess);
             });
             Assert.Equal(nameof(AwaitableAccess), result);
-        }
-
-        [Fact]
-        public static async Task AsynchronousAccess()
-        {
-            var resource = new AAESResource();
-
-            var tcs = new TaskCompletionSource<object?>();
-            resource.Access.Then(async () =>
-            {
-                await Task.Delay(500);
-                tcs.SetResult(null);
-            });
-            Assert.False(tcs.Task.IsCompleted);
-
-            var footprints = await resource.Access.ThenAsync(async () =>
-            {
-                var footprints = new List<int>();
-
-                footprints.Add(1);
-
-                resource.Access.Then(() =>
-                {
-                    footprints.Add(2);
-                    return default;
-                });
-
-                await Task.Delay(100);
-
-                footprints.Add(3);
-
-                return footprints;
-            });
-
-            Assert.True(tcs.Task.IsCompleted);
-
-            // wait for flush ...
-            await resource.Access.ThenAsync(() => default);
-
-            Assert.Equal(new[] { 1, 3, 2 }, footprints);
-        }
-
-        [Theory]
-        [InlineData(10000)]
-        public static async Task GuaranteedSequentialAccess(int maxNumber)
-        {
-            var resource = new AAESResource();
-
-            var actualList = new List<int>();
-            var expectedList = Enumerable.Range(1, maxNumber).ToList();
-
-            foreach (var number in expectedList)
-            {
-                resource.Access.Then(() =>
-                {
-                    actualList.Add(number);
-                    return default;
-                });
-            }
-
-            // wait for flush ...
-            await resource.Access.ThenAsync(() => default);
-
-            Assert.Equal(expectedList, actualList);
         }
 
         [Theory]
@@ -131,31 +117,55 @@ namespace AAES.Test
             Assert.Equal(threadCount * accessCount, number);
         }
 
-        [Fact]
-        public static void MultipleResourceAccess()
+        [Theory]
+        [InlineData(10000)]
+        public static async Task GuaranteedSequentialAccess(int maxNumber)
         {
-            var resource1 = new AAESResource();
-            var resource2 = new AAESResource();
-            var resource3 = new AAESResource();
+            var resource = new AAESResource();
 
-            AAESResource
-                .AccessTo(new[] { resource1, resource2, resource3 })
-                .Then(async () =>
+            var actualList = new List<int>();
+            var expectedList = Enumerable.Range(1, maxNumber).ToList();
+
+            foreach (var number in expectedList)
+            {
+                resource.Access.Then(() =>
                 {
-                    await Task.Yield();
-                    Console.WriteLine("do somthing");
+                    actualList.Add(number);
+                    return default;
+                });
+            }
+
+            // wait for flush ...
+            await resource.Access.ThenAsync(() => default);
+
+            Assert.Equal(expectedList, actualList);
+        }
+
+        [Fact]
+        public async Task MultipleResourceAccess()
+        {
+            var r1 = new AAESResource();
+            var r2 = new AAESResource();
+            var r3 = new AAESResource();
+
+            await AAESResource
+                .AccessTo(r1, r2, r3)
+                .ThenAsync(() =>
+                {
+                    this.output.WriteLine("do somthing");
+                    return default;
                 });
         }
 
         [Fact]
-        public static async Task WithWaitingTimeout()
+        public async Task WithWaitingTimeout()
         {
             var resource = new AAESResource();
 
             var t1 = resource.Access.ThenAsync(async () =>
             {
+                this.output.WriteLine("some long task");
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Console.WriteLine("some long task");
             });
 
             var t2 = resource.Access
@@ -169,8 +179,8 @@ namespace AAES.Test
 
             Assert.False(t1.IsCompleted);
 
-            // t2의 실패가 확정적이지만 완료는 t1의 완료까지 미뤄진다.
-            // t1이 완료되지 않았는데 t3가 시작되는 버그를 막기 위한 정책.
+            /// t2의 실패가 확정적이지만 완료는 t1의 완료까지 미뤄진다.
+            /// t1이 완료되지 않았는데 t3가 시작되는 버그를 막기 위한 정책.
             Assert.False(t2.IsCompleted);
 
             var t3 = resource.Access.ThenAsync(() =>
@@ -186,14 +196,14 @@ namespace AAES.Test
         }
 
         [Fact]
-        public static async Task WithCancellationToken()
+        public async Task WithCancellationToken()
         {
             var resource = new AAESResource();
 
             var t1 = resource.Access.ThenAsync(async () =>
             {
+                this.output.WriteLine("some long task");
                 await Task.Delay(TimeSpan.FromMilliseconds(100));
-                Console.WriteLine("some long task");
             });
 
             using var cts = new CancellationTokenSource();
@@ -210,8 +220,8 @@ namespace AAES.Test
 
             Assert.False(t1.IsCompleted);
 
-            // t2의 실패가 확정적이지만 완료는 t1의 완료까지 미뤄진다.
-            // t1이 완료되지 않았는데 t3가 시작되는 버그를 막기 위한 정책.
+            /// t2의 실패가 확정적이지만 완료는 t1의 완료까지 미뤄진다.
+            /// t1이 완료되지 않았는데 t3가 시작되는 버그를 막기 위한 정책.
             Assert.False(t2.IsCompleted);
 
             var t3 = resource.Access.ThenAsync(() =>

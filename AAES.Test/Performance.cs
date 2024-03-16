@@ -28,13 +28,17 @@ namespace AAES.Test
             var samples = new List<TimeSpan>(testCount);
 
             // 동기식 호출 방지 위해 재귀적으로 실행
+            var startTime = DateTime.UtcNow;
+            var totalElapsed = TimeSpan.Zero;
             Test(testCount);
             void Test(int remainCount)
             {
-                var startedAt = DateTime.Now;
+                var pushTime = DateTime.UtcNow;
                 resource.Access.Then(() =>
                 {
-                    samples.Add(DateTime.Now - startedAt);
+                    var now = DateTime.UtcNow;
+                    totalElapsed = now - startTime;
+                    samples.Add(now - pushTime);
                     if (--remainCount > 0)
                         Test(remainCount);
                     return default;
@@ -46,11 +50,12 @@ namespace AAES.Test
 
             samples.Sort();
             this.output.WriteLine(new StringBuilder()
-                .AppendLine($"min : {PrintMicroseconds(samples.First())}")
-                .AppendLine($"max : {PrintMicroseconds(samples.Last())}")
-                .AppendLine($"p50 : {PrintMicroseconds(samples[(int)(samples.Count * 0.5)])}")
-                .AppendLine($"p99 : {PrintMicroseconds(samples[(int)(samples.Count * 0.99)])}")
-                .AppendLine($"avg : {PrintMicroseconds(TimeSpan.FromTicks((long)samples.Average(e => (decimal)e.Ticks)))}")
+                .AppendLine($"min   : {PrintMicroseconds(samples.First())}")
+                .AppendLine($"max   : {PrintMicroseconds(samples.Last())}")
+                .AppendLine($"p50   : {PrintMicroseconds(samples[(int)(samples.Count * 0.5)])}")
+                .AppendLine($"p99   : {PrintMicroseconds(samples[(int)(samples.Count * 0.99)])}")
+                .AppendLine($"avg1  : {PrintMicroseconds(TimeSpan.FromTicks((long)samples.Average(e => (decimal)e.Ticks)))}")
+                .AppendLine($"avg2  : {PrintMicroseconds(totalElapsed / testCount)}")
                 .ToString());
 
             static string PrintMicroseconds(TimeSpan timeSpan)
@@ -94,7 +99,7 @@ namespace AAES.Test
             var taskFactory = isCpuBoundTask
                 ? new Func<ValueTask>(() =>
                 {
-                    for (var endedAt = DateTime.Now + taskCost; DateTime.Now < endedAt;) ;
+                    for (var endedAt = DateTime.UtcNow + taskCost; DateTime.UtcNow < endedAt;) ;
                     return default;
                 })
                 : new Func<ValueTask>(() =>
@@ -116,7 +121,7 @@ namespace AAES.Test
                 .ToArray();
 
             var publishers = new Task[publisherCount];
-            var startedAt = DateTime.Now;
+            var startedAt = DateTime.UtcNow;
             for (var i = 0; i < publisherCount; ++i)
             {
                 publishers[i] = Task.Run(async () =>
@@ -124,7 +129,7 @@ namespace AAES.Test
                     var random = new Random();
                     var targets = new List<AAESResource>(multiAccessMax);
 
-                    for (var nextPublishAt = DateTime.Now;
+                    for (var nextPublishAt = DateTime.UtcNow;
                         cts.IsCancellationRequested == false;
                         await DelayUntil(nextPublishAt))
                     {
@@ -152,7 +157,7 @@ namespace AAES.Test
 
                     static async ValueTask DelayUntil(DateTime dateTime)
                     {
-                        var delay = dateTime - DateTime.Now;
+                        var delay = dateTime - DateTime.UtcNow;
                         if (delay > TimeSpan.Zero)
                             await Task.Delay(delay);
                     }
@@ -160,14 +165,15 @@ namespace AAES.Test
             }
 
             await Task.Delay(TimeSpan.FromSeconds(3));
-            var elapsed = DateTime.Now - startedAt;
+            var elapsed = DateTime.UtcNow - startedAt;
 
             var countPerSecPerPub = Volatile.Read(ref count) / elapsed.TotalSeconds / publisherCount;
             this.output.WriteLine($"{caseName}: {countPerSecPerPub.ToString("#,##0.000")} count/sec/pub");
 
+            // wait for flush ...
             cts.Cancel();
             await Task.WhenAll(publishers);
-            await Task.WhenAll(resources.Select(e => e.Access.ThenAsync(() => default).AsTask()));
+            await AAESResource.AccessTo(resources).ThenAsync(() => default);
         }
     }
 }
