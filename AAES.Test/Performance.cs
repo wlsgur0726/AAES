@@ -9,7 +9,6 @@ using Xunit.Abstractions;
 
 namespace AAES.Test
 {
-    [CollectionDefinition(nameof(Performance))]
     public class Performance
     {
         private readonly ITestOutputHelper output;
